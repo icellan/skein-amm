@@ -313,7 +313,7 @@ func propLog(rng *rand.Rand, bits int) int64 {
 	return 1 + rng.Int63n(int64(1)<<uint(1+rng.Intn(bits)))
 }
 
-// --- 12. random swaps ---
+// --- random swaps ---
 
 var propCfgs = [][3]int64{{0, 0, 0}, {30, 5, 0}, {30, 5, 10}, {1, 1, 1}, {2500, 2500, 2500}, {9999, 0, 0}}
 
@@ -375,7 +375,7 @@ func TestPropSwapDifferential(t *testing.T) {
 	}
 }
 
-// --- 13. chains ---
+// --- chains ---
 
 // 200 swaps, each continuation the next swap's input, the validator key
 // rotated at every step; then Close. And a chain ending Rescind -> Close.
@@ -433,7 +433,7 @@ func TestPropSwapChain(t *testing.T) {
 	}
 }
 
-// --- 14. rounding edges ---
+// --- rounding edges ---
 
 // propExpect runs the swap the model describes and asserts the script agrees
 // with it: an honest valid swap passes on both inputs, an invalid one fails.
@@ -578,7 +578,7 @@ func TestPropRoundingOutput(t *testing.T) {
 	}
 }
 
-// --- 15. token amount push boundaries ---
+// --- token amount push boundaries ---
 
 var propBoundaries = []struct {
 	amount  *big.Int
@@ -724,7 +724,7 @@ func TestPropTokenPushBoundaries(t *testing.T) {
 	}
 }
 
-// --- 16. limits ---
+// --- limits ---
 
 func TestPropReserveLimits(t *testing.T) {
 	f := advFix(t, [3]int64{0, 0, 0})
@@ -836,7 +836,7 @@ func TestPropAmountInDomain(t *testing.T) {
 	}
 }
 
-// --- 17. OP_PUSH_TX robustness ---
+// --- OP_PUSH_TX robustness ---
 
 func propRandScript(rng *rand.Rand) []byte {
 	b := make([]byte, 20)
@@ -919,7 +919,7 @@ func TestPropPushTxRobustness(t *testing.T) {
 	}
 }
 
-// --- 18. Rúnar's sats change on Swap and Rescind ---
+// --- Rúnar's sats change on Swap and Rescind ---
 
 func TestPropSwapSatsChange(t *testing.T) {
 	f := advFix(t, [3]int64{30, 5, 10})

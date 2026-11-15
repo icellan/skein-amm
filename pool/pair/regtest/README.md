@@ -18,6 +18,14 @@ deploy is one funder transaction with the pool at output 0 and the vault at
 output 1. Every spend here has the pool at input 0 and the vault at input 1,
 unless a negative case moves them.
 
+The pool does not carry the vault's code: it carries `VaultCodeHash`
+(sha256 of the vault script, a readonly constructor arg), and Swap and
+Rescind take the vault code as their last declared argument (after
+`allPrevouts`, before Rúnar's `_changePKH`/`_changeAmount`), check it against
+the hash and build output 1 from it. Close takes no vault code. The
+validator's signature (Swap, Rescind) and the LP's (Close) must be
+SIGHASH_ALL|FORKID.
+
 ## What it proves
 
 - Script validity of both contract inputs, the pool and the vault, under the
@@ -44,9 +52,18 @@ unless a negative case moves them.
   accepted.
 - Every SDK-deployed pool's code equals a build from the artifact template
   done without the SDK: constructor slots spliced (assetIdA, assetIdB,
-  vaultCode, the three fee rates), codeSepIndex slots set to `OP_1`, and the
+  VaultCodeHash, the three fee rates), codeSepIndex slots set to `OP_1`, and the
   `codePartLenSlots` fields set to the deployed length. The SDK's vault
-  script equals the vault artifact's script (it has no slots).
+  script equals the vault artifact's script (it has no slots), and the
+  suite takes `VaultCodeHash` as sha256 of it.
+- The new rules refuse what they are meant to, and only them: a wrong vault
+  code fails at the `OP_SHA256 <hash> OP_EQUALVERIFY` compare, and a
+  signature of another sighash type fails at the compare of its last byte
+  with `0x41`. For Swap and Rescind the interpreter trace also shows the
+  signer's own `OP_CHECKSIGVERIFY` succeeding first, so the signature is
+  valid and only the type rule refuses it. In Close the type check runs
+  before the LP's signature check; there the signature's validity rests on
+  the harness verifying it against its type's digest.
 
 ## What it does not prove
 
@@ -66,7 +83,8 @@ unless a negative case moves them.
   validation-time limits could refuse transactions this node takes. The
   suite pays 100 sat/kB by default (`FEE_RATE_SAT_PER_KB`).
 - The validator's and the overlays' rules: affirmation checks, key
-  derivation, prefix == state on admission, the canonical VaultCode.
+  derivation, prefix == state on admission, `VaultCodeHash` being the
+  canonical vault's.
 - The 32-byte `nextValidatorPubKey` case builds its continuation with the
   short key in state. That shows the node refuses this spend, not that no
   continuation could pass.
@@ -121,6 +139,24 @@ transaction it sent, with size, the unlocking-script sizes of the first pool
 and vault inputs, fee and the node's verdict, then the accepted/rejected
 counts.
 
+## Sizes
+
+At Rúnar main (6bd5e29f4), fees {30, 5, 10}, 70-byte affirmation; the fee
+is at the default 100 sat/kB (at 1 sat/kB: 6, 18, 18, 18 and 12 sats). The
+unlock columns are the pool's and the vault's unlocking scripts.
+
+| | tx bytes | pool unlock | vault unlock | fee |
+|---|---|---|---|---|
+| deploy (pool 4987-byte script, code 4689; vault 553-byte script) | 5752 | | | 576 |
+| Swap | 17714 | 10661 | 821 | 1773 |
+| Swap with token change and Rúnar sats change | 17823 | 10666 | 821 | 1783 |
+| Rescind (with Rúnar change) | 17150 | 10526 | 785 | 1716 |
+| Close | 11155 | 9983 | 785 | 1116 |
+
+The pool unlock carries `_codePart` (the code), the preimage (whose
+scriptCode is the pool script again) and, for Swap and Rescind, the vault
+code (518 bytes pushed).
+
 ## The cases
 
 | | test |
@@ -137,15 +173,17 @@ counts.
 | vault theft: the vault alone; after a plain funding input; another pair's pool honestly Closed at 0 with its vault at 1 and the victim vault at 2 (only the victim vault fails); another pair's pool Closed with the victim vault at 1 in place of its own (both fail); the victim's honest Close with the vault's preimage ALL\|ANYONECANPAY (only the vault fails) | `TestVaultTheftRejected` |
 | Close refused: validator-signed, random key | `TestCloseRejected` |
 | Rescind refused: LP-signed; second Rescind; Swap after Rescind | `TestRescindRejected` |
+| wrong `vaultCode` for Swap and for Rescind (the vault's code with its last byte flipped; a stranger's P2PKH), each with output 1 built from it and with output 1 the real vault (the pool fails) | `TestVaultCodeArgumentRejected` |
+| Swap, Rescind and Close each signed with a valid NONE\|FORKID and a valid ALL\|ANYONECANPAY\|FORKID signature (the pool fails at the `0x41` compare; the trace is checked) | `TestSignerSighashTypeRejected` |
 | hand-spliced template (fund lock of both tokens) | `TestHandSplicedTemplate_FundLock` |
 
 ### The hand-spliced template
 
-At Rúnar HEAD, PairPool's code has three `verify_code_part_len` fields
-(`04 <len:4 LE> OP_BIN2NUM OP_NUMEQUAL OP_VERIFY`). The artifact template
-holds a compile-time lower bound in them (the template's own length, 4299
-bytes at the time of writing), and only the SDK writes the deployed length
-(about 5590 bytes: the vault code is spliced in twice).
+At Rúnar main (6bd5e29f4), PairPool's code has three `verify_code_part_len`
+fields (`04 <len:4 LE> OP_BIN2NUM OP_NUMEQUAL OP_VERIFY`). The artifact
+template (4368 bytes) holds a compile-time lower bound in them (4432), and
+only the SDK writes the deployed length (4689 bytes at fees {30, 5, 10},
+4688 at {0, 0, 0}).
 
 `TestHandSplicedTemplate_FundLock` builds pool code from the template the
 way a non-SDK builder would: constructor slots spliced, codeSepIndex slots

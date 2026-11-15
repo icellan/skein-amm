@@ -3,6 +3,7 @@
 package regtest
 
 import (
+	"bytes"
 	"testing"
 
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
@@ -297,4 +298,133 @@ func TestRescindRejected(t *testing.T) {
 	t.Run("the LP's Close of the rescinded pair", func(t *testing.T) {
 		e.sub(t).close(pr)
 	})
+}
+
+// Swap and Rescind take the vault's code as an argument, checked against
+// VaultCodeHash. Two wrong codes, each with output 1 built from it and with
+// output 1 the real vault. Only the pool input fails.
+func TestVaultCodeArgumentRejected(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	pr := e.deploySDK(newParams(t, 30, 5, 10, 71), newPairState(t))
+	codes := []struct {
+		name string
+		code func() []byte
+	}{
+		{"the vault's code, last byte flipped", func() []byte {
+			c := append([]byte{}, pr.vault...)
+			c[len(c)-1] ^= 1
+			return c
+		}},
+		{"a P2PKH to a stranger", func() []byte { return p2pkhScript(pkh(newKey(t))) }},
+	}
+	// variants applies a wrong code to an honest Swap or Rescind whose output 1
+	// would hold b tokens.
+	variants := func(name string, honest func() (*spend, int64), done func(e *env)) {
+		t.Run(name, func(t *testing.T) {
+			for _, c := range codes {
+				for _, fromWrong := range []bool{true, false} {
+					s, b := honest()
+					code := c.code()
+					s.ins[0].vaultCode = code
+					s.label = "BAD " + name + ": vaultCode " + c.name + ", output 1 the real vault"
+					if fromWrong {
+						s.outs[1].script = append(tokenPrefix(pr.p.assetB, b), code...)
+						s.label = "BAD " + name + ": vaultCode " + c.name + ", output 1 built from it"
+					}
+					s.trace = true
+					e.sub(t).reject(s, consensusReject, 0)
+					if name == "Swap" {
+						e.sub(t).swap(pr, planSwap(t, pr, 20_000, true)) // the honest spend of the same pair
+					}
+				}
+			}
+			done(e.sub(t))
+		})
+	}
+	variants("Swap", func() (*spend, int64) {
+		r := planSwap(t, pr, 20_000, true)
+		return swapSpend(pr, r), r.after.b
+	}, func(*env) {})
+	variants("Rescind", func() (*spend, int64) { return rescindSpend(t, pr, 0), pr.st.b }, func(e *env) { e.rescind(pr, 0) })
+	e.close(pr)
+}
+
+// The validator's (Swap, Rescind) and the LP's (Close) signature must be
+// ALL|FORKID. Each case signs over the real digest of its own type, so the
+// signature verifies (build checks it) and only requireSighashAll can refuse
+// it; the trace shows where the pool input stops.
+func TestSignerSighashTypeRejected(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	pr := e.deploySDK(newParams(t, 30, 5, 10, 71), newPairState(t))
+	flags := []struct {
+		name string
+		flag sighash.Flag
+	}{
+		{"NONE|FORKID", sighash.NoneForkID},
+		{"ALL|ANYONECANPAY|FORKID", sighash.AllForkID | sighash.AnyOneCanPay},
+	}
+	methods := []struct {
+		name   string
+		honest func() *spend
+		after  func(e *env) // the honest spend once a method's cases are done (Swap: after each)
+		each   bool
+	}{
+		{"Swap", func() *spend { return swapSpend(pr, planSwap(t, pr, 20_000, true)) },
+			func(e *env) { e.swap(pr, planSwap(e.t, pr, 20_000, true)) }, true},
+		{"Rescind", func() *spend { return rescindSpend(t, pr, 0) }, func(e *env) { e.rescind(pr, 0) }, false},
+		{"Close", func() *spend { return closeSpend(t, pr) }, func(e *env) { e.close(pr) }, false},
+	}
+	for _, m := range methods {
+		t.Run(m.name, func(t *testing.T) {
+			for _, f := range flags {
+				s := m.honest()
+				s.label = "BAD " + m.name + ": signer's sighash " + f.name
+				s.ins[0].sigFlag = f.flag
+				s.trace = true
+				e.sub(t).reject(s, consensusReject, 0)
+				checkSighashAllRefused(t, m.name, s.traces[0], s.ins[0].signer.PubKey().Compressed())
+				if m.each {
+					m.after(e.sub(t))
+				}
+			}
+			if !m.each {
+				m.after(e.sub(t))
+			}
+		})
+	}
+}
+
+// checkSighashAllRefused: the pool input stopped at requireSighashAll's
+// compare with 0x41 (`... OP_DATA_1(41) OP_EQUALVERIFY`). In Swap and Rescind
+// CheckSig runs first, so the signer's own OP_CHECKSIG(VERIFY), against the
+// signer's key, must have executed and succeeded before that: the signature
+// verifies and only the type rule refuses it. In Close requireSighashAll runs
+// first, so the signer's key must not have been reached.
+func checkSighashAllRefused(t *testing.T, method string, d *tracer, signerPub []byte) {
+	t.Helper()
+	if d == nil {
+		t.Fatalf("%s: no trace of the pool input", method)
+	}
+	n := len(d.recent)
+	if n < 2 || d.recent[n-1] != "OP_EQUALVERIFY" || d.recent[n-2] != "OP_DATA_1(41)" {
+		t.Errorf("%s: the pool input did not stop at the 0x41 compare: %v after %v", method, d.err, d.recent)
+	}
+	signerChecked := false
+	for _, c := range d.checksigs {
+		if bytes.Equal(c.pubKey, signerPub) {
+			signerChecked = true
+			if !c.ok {
+				t.Errorf("%s: the signer's %s failed: %v", method, c.op, d.checksigs)
+			}
+		}
+	}
+	switch {
+	case method != "Close" && !signerChecked:
+		t.Errorf("%s: the signer's key was never checked before the refusal: %v", method, d.checksigs)
+	case method == "Close" && signerChecked:
+		t.Errorf("Close: the LP's key was checked before requireSighashAll: %v", d.checksigs)
+	}
+	t.Logf("%s: the signer's signature check %s before requireSighashAll refused it", method, map[bool]string{true: "SUCCEEDED", false: "was not reached"}[signerChecked])
 }

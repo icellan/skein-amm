@@ -160,6 +160,7 @@ func artifact(t testing.TB, src string) *runar.RunarArtifact {
 func newFixture(t testing.TB, lpBps, valBps, comBps int64) *fixture {
 	t.Helper()
 	vault, _ := hex.DecodeString(runar.NewRunarContract(artifact(t, "Vault.runar.go"), nil).GetLockingScript())
+	vaultHash := sha256.Sum256(vault)
 	p := pair{sats: 1, a: 1000, b: 1000, lp: key(1), validator: key(2)}
 	c := runar.NewRunarContract(artifact(t, "PairPool.runar.go"), []interface{}{
 		p.a, p.b,
@@ -172,7 +173,7 @@ func newFixture(t testing.TB, lpBps, valBps, comBps int64) *fixture {
 		hex.EncodeToString(affirmation),
 		hex.EncodeToString(assetA),
 		hex.EncodeToString(assetB),
-		hex.EncodeToString(vault),
+		hex.EncodeToString(vaultHash[:]),
 		lpBps, valBps, comBps,
 	})
 	full, _ := hex.DecodeString(c.GetLockingScript())
@@ -220,6 +221,8 @@ type spend struct {
 	args     [][]byte       // the method's declared args after the signature and before allPrevouts
 	change   *out           // Rúnar's change (script = the pkh), Swap and Rescind
 	prevouts []byte         // allPrevouts for the pool; nil: the real ones
+	vaultArg []byte         // the vaultCode argument (Swap, Rescind); nil: the vault's code
+	sigFlag  sighash.Flag   // the pool signature's sighash type; 0: ALL|FORKID
 
 	vaultPrevouts []byte       // allPrevouts for the vault; nil: the real ones
 	vaultSighash  sighash.Flag // 0: ALL|FORKID
@@ -288,7 +291,13 @@ func (f *fixture) run(t testing.TB, s spend) result {
 	var r result
 	if s.poolIdx >= 0 {
 		pre := preimage(s.poolIdx, sighash.AllForkID)
-		h := sha256.Sum256(pre)
+		// The signer signs the digest of its own sighash type (the script's
+		// OP_CHECKSIG hashes by the signature's last byte).
+		sigFlag := s.sigFlag
+		if sigFlag == 0 {
+			sigFlag = sighash.AllForkID
+		}
+		h := sha256.Sum256(preimage(s.poolIdx, sigFlag))
 		d := sha256.Sum256(h[:])
 		sig, err := s.signer.Sign(d[:])
 		if err != nil {
@@ -299,12 +308,17 @@ func (f *fixture) run(t testing.TB, s spend) result {
 			prevouts = real
 		}
 		u := pushData(f.code) // _codePart
-		u = append(u, pushData(append(sig.Serialize(), 0x41))...)
+		u = append(u, pushData(append(sig.Serialize(), byte(sigFlag)))...)
 		for _, a := range s.args {
 			u = append(u, a...)
 		}
 		u = append(u, pushData(prevouts)...)
 		if s.method != methodClose {
+			vaultArg := s.vaultArg
+			if vaultArg == nil {
+				vaultArg = f.vault
+			}
+			u = append(u, pushData(vaultArg)...)
 			cp, ca := make([]byte, 20), int64(0)
 			if s.change != nil {
 				cp, ca = s.change.script, s.change.sats
@@ -982,6 +996,66 @@ func TestTwoPoolsInOneTransaction(t *testing.T) {
 	r := f.run(t, second)
 	mustFailPool(t, r)
 	mustFailVault(t, r)
+}
+
+// The vault's script is an argument, checked against VaultCodeHash: any other
+// bytes are refused, whatever output 1 then holds.
+func TestVaultCodeArgument(t *testing.T) {
+	f := newFixture(t, 30, 5, 10)
+	p := fresh()
+	sw, r := f.swap(p, 40_000, true)
+	rs, after := f.rescind(p)
+	for name, tc := range map[string]struct {
+		s     spend
+		after pair
+	}{"Swap": {sw, r.after}, "Rescind": {rs, after}} {
+		t.Run(name+": honest", func(t *testing.T) { mustPass(t, f.run(t, tc.s)) })
+		other := tokenP2pkh(assetB, tc.after.b, pkh(p.validator))[len(tokenPrefix(assetB, tc.after.b)):]
+		for alt, code := range map[string][]byte{
+			"a P2PKH to the validator":  other,
+			"empty":                     {},
+			"the vault's, one byte off": append(append([]byte{}, f.vault[:len(f.vault)-1]...), f.vault[len(f.vault)-1]^1),
+			"the vault's, one byte on":  append(append([]byte{}, f.vault...), 0x61),
+		} {
+			t.Run(name+": vaultCode "+alt+", output 1 built from it", func(t *testing.T) {
+				c := tc.s
+				c.outs = clone(tc.s.outs)
+				c.vaultArg = code
+				c.outs[1].script = append(tokenPrefix(assetB, tc.after.b), code...)
+				mustFailPool(t, f.run(t, c))
+			})
+			t.Run(name+": vaultCode "+alt+", output 1 the real vault", func(t *testing.T) {
+				c := tc.s
+				c.vaultArg = code
+				mustFailPool(t, f.run(t, c))
+			})
+		}
+	}
+}
+
+// The validator's and the LP's signatures must be ALL|FORKID: a valid
+// signature of any other type is refused by every method.
+func TestSignatureSighashType(t *testing.T) {
+	f := newFixture(t, 30, 5, 10)
+	p := fresh()
+	sw, _ := f.swap(p, 40_000, true)
+	rs, _ := f.rescind(p)
+	for name, s := range map[string]spend{"Swap": sw, "Rescind": rs, "Close": f.close(p)} {
+		t.Run(name+": ALL|FORKID", func(t *testing.T) { mustPass(t, f.run(t, s)) })
+		for flagName, flag := range map[string]sighash.Flag{
+			"NONE":                sighash.NoneForkID,
+			"SINGLE":              sighash.SingleForkID,
+			"ALL|ANYONECANPAY":    sighash.AllForkID | sighash.AnyOneCanPay,
+			"NONE|ANYONECANPAY":   sighash.NoneForkID | sighash.AnyOneCanPay,
+			"SINGLE|ANYONECANPAY": sighash.SingleForkID | sighash.AnyOneCanPay,
+		} {
+			t.Run(name+": "+flagName, func(t *testing.T) {
+				c := s
+				c.sigFlag = flag
+				mustFailPool(t, f.run(t, c))
+			})
+		}
+	}
 }
 
 func TestSizes(t *testing.T) {

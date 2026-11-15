@@ -92,6 +92,7 @@ type template struct {
 		Methods     []struct {
 			Name     string
 			IsPublic bool
+			Params   []struct{ Name string }
 		}
 	}
 }
@@ -101,6 +102,9 @@ type compiledPair struct {
 	tmpl  template            // the pool's
 	raw   []byte              // the pool's template script bytes
 	vault []byte              // the vault's code: no slots, so the template script itself
+	// vaultHash is sha256(vault): the pool's VaultCodeHash constructor arg.
+	// Swap and Rescind take the vault code itself as their last declared arg.
+	vaultHash []byte
 }
 
 var compileOnce struct {
@@ -173,11 +177,35 @@ func compilePair() (*compiledPair, error) {
 	for _, p := range c.tmpl.ABI.Constructor.Params {
 		params = append(params, p.Name)
 	}
-	if got, want := strings.Join(params, ","), "reserveA,reserveB,lpPubKey,validatorPubKey,validatorIdentity,nonce,lpFeeAPkh,lpFeeBPkh,affirmation,assetIdA,assetIdB,vaultCode,lpFeeBps,validatorFeeBps,commissionBps"; got != want {
+	if got, want := strings.Join(params, ","), "reserveA,reserveB,lpPubKey,validatorPubKey,validatorIdentity,nonce,lpFeeAPkh,lpFeeBPkh,affirmation,assetIdA,assetIdB,vaultCodeHash,lpFeeBps,validatorFeeBps,commissionBps"; got != want {
 		return nil, fmt.Errorf("pool constructor params changed: %s", got)
 	}
 	if got := publicMethods(c.tmpl); got != "swap,close,rescind" {
 		return nil, fmt.Errorf("pool public methods changed: %s", got)
+	}
+	// The args the unlocking scripts push, in order (build()). An artifact
+	// may list the implicit ones too (_changePKH, _changeAmount, txPreimage);
+	// then they must sit where build() pushes them.
+	for _, m := range c.tmpl.ABI.Methods {
+		if !m.IsPublic {
+			continue
+		}
+		var names []string
+		for _, p := range m.Params {
+			names = append(names, p.Name)
+		}
+		declared := map[string]string{
+			"swap":    "validatorSig,nextValidatorPubKey,amountIn,aIn,userPkh,commissionPkh,tokenChangePkh,tokenChange,allPrevouts,vaultCode",
+			"close":   "lpSig,allPrevouts",
+			"rescind": "validatorSig,allPrevouts,vaultCode",
+		}[m.Name]
+		implicit := ",_changePKH,_changeAmount,txPreimage"
+		if m.Name == "close" {
+			implicit = ",txPreimage"
+		}
+		if got := strings.Join(names, ","); got != declared && got != declared+implicit {
+			return nil, fmt.Errorf("%s's args changed: %s", m.Name, got)
+		}
 	}
 	if !bytes.HasPrefix(c.raw, []byte{0x61, 0xab}) {
 		return nil, fmt.Errorf("pool code does not start with OP_NOP OP_CODESEPARATOR: %x", c.raw[:4])
@@ -214,6 +242,8 @@ func compilePair() (*compiledPair, error) {
 	if !bytes.HasPrefix(c.vault, []byte{0x76, 0xab}) {
 		return nil, fmt.Errorf("vault code does not start with OP_DUP OP_CODESEPARATOR: %x", c.vault[:4])
 	}
+	h := sha256.Sum256(c.vault)
+	c.vaultHash = h[:]
 	return c, nil
 }
 
@@ -344,7 +374,7 @@ func poolScript(p params, code []byte, s pairState) []byte {
 	return append(out, stateBytes(p, s)...)
 }
 
-// vaultScript is output 1: prefix(B, ReserveB) || VaultCode.
+// vaultScript is output 1: prefix(B, ReserveB) || the vault code.
 func vaultScript(p params, vault []byte, s pairState) []byte {
 	return append(tokenPrefix(p.assetB, s.b), vault...)
 }
@@ -366,7 +396,7 @@ func sdkCode(t *testing.T, c *compiledPair, p params, s pairState) []byte {
 		hex.EncodeToString(p.affirmation),
 		hex.EncodeToString(p.assetA),
 		hex.EncodeToString(p.assetB),
-		hex.EncodeToString(c.vault),
+		hex.EncodeToString(c.vaultHash),
 		p.lpBps, p.validatorBps, p.commissionBps,
 	})
 	full, err := hex.DecodeString(ct.GetLockingScript())
@@ -426,7 +456,7 @@ func spliceTemplate(t *testing.T, c *compiledPair, p params) ([]byte, []int) {
 		case 10:
 			b = pushData(p.assetB)
 		case 11:
-			b = pushData(c.vault)
+			b = pushData(c.vaultHash)
 		case 12:
 			b = pushNum(p.lpBps)
 		case 13:
@@ -826,12 +856,15 @@ type input struct {
 	coin *coin // kindCoin
 	pr   *pair // kindPool, kindVault
 
-	// The pool's unlocking: _codePart, sig, args, allPrevouts,
-	// [_changePKH, _changeAmount] (not Close), txPreimage, method index.
+	// The pool's unlocking: _codePart, sig, args, allPrevouts, [vaultCode,
+	// _changePKH, _changeAmount] (not Close), txPreimage (always ALL|FORKID,
+	// Rúnar's own check), method index.
 	method     int
 	signer     *ec.PrivateKey
-	args       [][]byte // the method's args after the signature, before allPrevouts
-	changePkh  []byte   // Rúnar change; nil: none (zero PKH, amount 0)
+	sigFlag    sighash.Flag // the signer's sighash type (its digest and last byte); 0: ALL|FORKID
+	args       [][]byte     // the method's args after the signature, before allPrevouts
+	vaultCode  []byte       // the vaultCode arg (Swap, Rescind); nil: the pair's vault code
+	changePkh  []byte       // Rúnar change; nil: none (zero PKH, amount 0)
 	changeSats int64
 	codePart   []byte // nil: the pair's code
 	prevouts   []byte // allPrevouts (pool or vault); nil: the transaction's own
@@ -874,6 +907,10 @@ type spend struct {
 	// watch are pairs, beyond those spent here, whose UTXOs a rejection must
 	// leave unspent.
 	watch []*pair
+	// trace: reject also traces each failing contract input (the checksigs it
+	// ran and the opcodes before its error) into traces, by input index.
+	trace  bool
+	traces map[int]*tracer
 }
 
 type built struct {
@@ -947,24 +984,39 @@ func (e *env) build(s *spend, fee int64) built {
 		}
 		switch in.kind {
 		case kindPool:
-			pre := preimage(t, tx, i, in.pr.st.sats, scriptCodeAfter(t, in.pr.poolLock, 0x61), sighash.AllForkID)
-			h1 := sha256.Sum256(pre)
+			sc := scriptCodeAfter(t, in.pr.poolLock, 0x61)
+			pre := preimage(t, tx, i, in.pr.st.sats, sc, sighash.AllForkID)
+			// The signer signs the digest of its own sighash type: the
+			// script's OP_CHECKSIG hashes by the signature's last byte.
+			sigFlag := in.sigFlag
+			if sigFlag == 0 {
+				sigFlag = sighash.AllForkID
+			}
+			h1 := sha256.Sum256(preimage(t, tx, i, in.pr.st.sats, sc, sigFlag))
 			digest := sha256.Sum256(h1[:])
 			sig, err := in.signer.Sign(digest[:])
 			if err != nil {
 				t.Fatal(err)
+			}
+			if !sig.Verify(digest[:], in.signer.PubKey()) {
+				t.Fatalf("%s: the pool input's signature does not verify over its own sighash type's digest", s.label)
 			}
 			codePart := in.codePart
 			if codePart == nil {
 				codePart = in.pr.code
 			}
 			u := pushData(codePart)
-			u = append(u, pushData(append(sig.Serialize(), 0x41))...)
+			u = append(u, pushData(append(sig.Serialize(), byte(sigFlag)))...)
 			for _, a := range in.args {
 				u = append(u, a...)
 			}
 			u = append(u, pushData(prevouts)...)
-			if in.method != methodClose { // Close adds no output: no change parameters
+			if in.method != methodClose { // Close writes no output: no vaultCode, no change parameters
+				vaultCode := in.vaultCode
+				if vaultCode == nil {
+					vaultCode = in.pr.vault
+				}
+				u = append(u, pushData(vaultCode)...)
 				chPkh, chSats := make([]byte, 20), int64(0)
 				if in.changePkh != nil {
 					chPkh, chSats = in.changePkh, in.changeSats
@@ -1126,6 +1178,14 @@ func (e *env) reject(s *spend, want string, failing ...int) string {
 		t.Errorf("%s: the interpreter fails contract inputs %v, the case expects %v", s.label, gotFail, failing)
 	}
 	e.logVerdicts(s, v)
+	if s.trace {
+		s.traces = map[int]*tracer{}
+		for _, i := range gotFail {
+			d := trace(s, b, i)
+			s.traces[i] = d
+			t.Logf("  trace: input %d (%s): checksigs %v; %v after %v", i, s.ins[i], d.checksigs, d.err, d.recent)
+		}
+	}
 
 	txid, err := node.SendRawTransaction(b.tx.Hex())
 	if err == nil {
@@ -1370,4 +1430,92 @@ func (e *env) close(pr *pair) string {
 	e.checkPayerPaysMiner(s, got, b)
 	pr.txid = ""
 	return txid
+}
+
+// ---------------------------------------------------------------------------
+// Tracing one contract input (which check refuses a spend)
+// ---------------------------------------------------------------------------
+
+// tracer is a go-sdk interpreter Debugger recording, for the locking script,
+// every OP_CHECKSIG / OP_CHECKSIGVERIFY actually executed (not in a skipped
+// branch) with the public key it checked against and its outcome, and the
+// last executed opcodes before an error.
+type tracer struct {
+	checksigs []checksig
+	recent    []string // the last opcodes executed in the locking script
+	err       error
+	pending   *checksig
+}
+
+type checksig struct {
+	op     string
+	pubKey []byte
+	ok     bool
+}
+
+func (c checksig) String() string { return fmt.Sprintf("%s(%x..)=%v", c.op, firstN(c.pubKey, 4), c.ok) }
+
+func executing(s *interpreter.State) bool {
+	return s.ScriptIdx == 1 && (len(s.CondStack) == 0 || s.CondStack[len(s.CondStack)-1] == 1)
+}
+
+func (d *tracer) BeforeExecute(*interpreter.State) {}
+func (d *tracer) AfterExecute(*interpreter.State)  {}
+func (d *tracer) BeforeStep(*interpreter.State)    {}
+func (d *tracer) AfterStep(*interpreter.State)     {}
+func (d *tracer) BeforeExecuteOpcode(s *interpreter.State) {
+	d.pending = nil
+	if !executing(s) {
+		return
+	}
+	op := s.Opcode()
+	name := op.Name()
+	if len(op.Data) > 0 && len(op.Data) <= 4 {
+		name = fmt.Sprintf("%s(%x)", name, op.Data)
+	}
+	d.recent = append(d.recent, name)
+	if len(d.recent) > 10 {
+		d.recent = d.recent[1:]
+	}
+	if n := op.Name(); n == "OP_CHECKSIG" || n == "OP_CHECKSIGVERIFY" {
+		d.pending = &checksig{op: n, pubKey: append([]byte{}, s.DataStack[len(s.DataStack)-1]...)}
+	}
+}
+func (d *tracer) AfterExecuteOpcode(s *interpreter.State) {
+	if d.pending == nil {
+		return
+	}
+	c := *d.pending
+	d.pending = nil
+	c.ok = true // a failed OP_CHECKSIGVERIFY errors out instead
+	if c.op == "OP_CHECKSIG" {
+		top := s.DataStack[len(s.DataStack)-1]
+		c.ok = len(top) > 0 && !bytes.Equal(top, []byte{0})
+	}
+	d.checksigs = append(d.checksigs, c)
+}
+func (d *tracer) BeforeScriptChange(*interpreter.State)      {}
+func (d *tracer) AfterScriptChange(*interpreter.State)       {}
+func (d *tracer) AfterSuccess(*interpreter.State)            {}
+func (d *tracer) AfterError(_ *interpreter.State, err error) { d.err = err }
+func (d *tracer) BeforeStackPush(*interpreter.State, []byte) {}
+func (d *tracer) AfterStackPush(*interpreter.State, []byte)  {}
+func (d *tracer) BeforeStackPop(*interpreter.State)          {}
+func (d *tracer) AfterStackPop(*interpreter.State, []byte)   {}
+
+// trace runs input idx of b through the interpreter with a tracer.
+func trace(s *spend, b built, idx int) *tracer {
+	c := s.ins[idx].src()
+	d := &tracer{}
+	err := interpreter.NewEngine().Execute(
+		interpreter.WithTx(b.tx, idx, &transaction.TransactionOutput{Satoshis: uint64(c.sats), LockingScript: script.NewFromBytes(c.lock)}),
+		interpreter.WithForkID(),
+		interpreter.WithAfterGenesis(),
+		interpreter.WithAfterChronicle(),
+		interpreter.WithDebugger(d),
+	)
+	if d.err == nil {
+		d.err = err
+	}
+	return d
 }

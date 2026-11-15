@@ -11,7 +11,7 @@ import (
 
 // a pair whose pool code was built WITHOUT the SDK, from the
 // artifact template with the constructor slots spliced (assetIdA, assetIdB,
-// vaultCode, the three fee rates) and the codeSepIndex slots set to OP_1, the
+// VaultCodeHash, the three fee rates) and the codeSepIndex slots set to OP_1, the
 // way a non-SDK builder that predates Rúnar's codePartLenSlots would.
 // The template's verify_code_part_len fields hold a compile-time lower bound,
 // and only the SDK writes the deployed code length into them. A pool deployed
@@ -53,7 +53,7 @@ func TestHandSplicedTemplate_FundLock(t *testing.T) {
 		e.close(pr)
 		return
 	}
-	t.Logf("artifact codePartLenSlots (template offsets): %+v", c.tmpl.CodePartLenSlots)
+	t.Logf("artifact template %d bytes; codePartLenSlots (template offsets): %+v", len(c.raw), c.tmpl.CodePartLenSlots)
 
 	for _, fees := range [][3]int64{{30, 5, 10}, {0, 0, 0}} {
 		feeName := fmt.Sprintf("fees %d-%d-%d", fees[0], fees[1], fees[2])

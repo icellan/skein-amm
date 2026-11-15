@@ -33,6 +33,9 @@
 // ValidatorFeeBps to Hash160 of the current ValidatorPubKey, CommissionBps to
 // the commissionPkh the relay names.
 //
+// The validator's and the LP's signatures must be SIGHASH_ALL|FORKID
+// (requireSighashAll; Pool leaves the type to the signer).
+//
 // The script can see no token input, in either direction. Every Swap needs
 // the validator's signature, and the validator is trusted to confirm the
 // token inputs of both assets cover the token outputs. (Pool's sats-in
@@ -52,13 +55,14 @@
 // What the lookup must check when a pair is admitted, since the scripts
 // cannot: the pool at output 0 and the vault at output 1 of one transaction;
 // both prefixes equal to the reserves in state, the ids to AssetIdA and
-// AssetIdB; VaultCode and the vault's script the canonical Vault; the vault 1
-// sat (its sats are not carried: any more leave through a Swap's change); the
-// Affirmation framed as Rúnar writes it (one length byte, 0 to 0x4b, then
-// exactly the rest of the script: the state reader also takes a PUSHDATA
-// framing, the writer never writes one, and poolScript relies on the two
-// lengths being equal). The vault checks only outpoints, never what sits at
-// output 0.
+// AssetIdB, each 32 bytes and the two different; the vault's script the
+// canonical Vault and VaultCodeHash its sha256; the vault 1 sat (its sats
+// are not carried: any more leave through a Swap's change); the
+// Affirmation framed as Rúnar writes it (the shortest push for its length,
+// then exactly the rest of the script: the state reader also takes a longer
+// framing, the writer always writes the shortest, and poolScript relies on
+// the two lengths being equal). The vault checks only outpoints, never what
+// sits at output 0.
 //
 // The deploy's builder must check the same two outputs before it broadcasts:
 // a pool deployed with anything but its vault at output 1 (a wallet's token
@@ -88,12 +92,13 @@ type PairPool struct {
 	// The two tokens' canonical 32-byte BRC-162 ids.
 	AssetIdA runar.ByteString `runar:"readonly"`
 	AssetIdB runar.ByteString `runar:"readonly"`
-	// VaultCode is the compiled Vault script, the same bytes in every pool.
-	// The lookup checks it is the canonical one.
-	VaultCode       runar.ByteString `runar:"readonly"`
-	LpFeeBps        runar.Bigint     `runar:"readonly"`
-	ValidatorFeeBps runar.Bigint     `runar:"readonly"`
-	CommissionBps   runar.Bigint     `runar:"readonly"`
+	// VaultCodeHash is sha256 of the compiled Vault script, the same in every
+	// pool; Swap and Rescind take the script itself as an argument. The lookup
+	// checks it is the canonical one's.
+	VaultCodeHash   runar.Sha256Digest `runar:"readonly"`
+	LpFeeBps        runar.Bigint       `runar:"readonly"`
+	ValidatorFeeBps runar.Bigint       `runar:"readonly"`
+	CommissionBps   runar.Bigint       `runar:"readonly"`
 }
 
 // Swap trades amountIn of one token for the other along x·y = k. aIn selects
@@ -105,9 +110,11 @@ type PairPool struct {
 // then the taker's token change (the input token), tokenChange to
 // tokenChangePkh, only when nonzero; then Rúnar's sats change.
 //
-// allPrevouts is the transaction's input outpoints, 36 bytes each, in order.
-func (c *PairPool) Swap(validatorSig runar.Sig, nextValidatorPubKey runar.PubKey, amountIn runar.Bigint, aIn runar.Bool, userPkh runar.Addr, commissionPkh runar.Addr, tokenChangePkh runar.Addr, tokenChange runar.Bigint, allPrevouts runar.ByteString) {
+// allPrevouts is the transaction's input outpoints, 36 bytes each, in order;
+// vaultCode the compiled Vault script (VaultCodeHash's preimage).
+func (c *PairPool) Swap(validatorSig runar.Sig, nextValidatorPubKey runar.PubKey, amountIn runar.Bigint, aIn runar.Bool, userPkh runar.Addr, commissionPkh runar.Addr, tokenChangePkh runar.Addr, tokenChange runar.Bigint, allPrevouts runar.ByteString, vaultCode runar.ByteString) {
 	runar.Assert(runar.CheckSig(validatorSig, c.ValidatorPubKey))
+	c.requireSighashAll(validatorSig)
 	runar.Assert(amountIn > 0)
 	runar.Assert(tokenChange >= 0)
 	c.requireVault(allPrevouts, runar.ExtractHashPrevouts(c.TxPreimage), runar.ExtractOutpoint(c.TxPreimage))
@@ -149,7 +156,7 @@ func (c *PairPool) Swap(validatorSig runar.Sig, nextValidatorPubKey runar.PubKey
 	c.ReserveA = newA
 	c.ReserveB = newB
 	c.ValidatorPubKey = nextValidatorPubKey
-	c.writePair(sats)
+	c.writePair(sats, vaultCode)
 	c.AddRawOutput(1, c.tokenP2pkh(outAsset, out, userPkh))
 	// Scripts computed outside the conditionals (Pool's note: a conditional
 	// output whose argument inlines nested branches trips a codegen error).
@@ -175,6 +182,7 @@ func (c *PairPool) Swap(validatorSig runar.Sig, nextValidatorPubKey runar.PubKey
 // free. It requires the vault as input 1, so a Close that forgot the vault is
 // a rejected transaction, not a stranded reserve.
 func (c *PairPool) Close(lpSig runar.Sig, allPrevouts runar.ByteString) {
+	c.requireSighashAll(lpSig)
 	c.requireVault(allPrevouts, runar.ExtractHashPrevouts(c.TxPreimage), runar.ExtractOutpoint(c.TxPreimage))
 	// Last: a public method must end on an assert.
 	runar.Assert(runar.CheckSig(lpSig, c.LpPubKey))
@@ -183,12 +191,13 @@ func (c *PairPool) Close(lpSig runar.Sig, allPrevouts runar.ByteString) {
 // Rescind is the validator's withdrawal of its attestation: the pool and the
 // vault written back unchanged at outputs 0 and 1, ValidatorPubKey cleared to
 // 33 zero bytes. No Swap and no second Rescind after it; the LP closes.
-func (c *PairPool) Rescind(validatorSig runar.Sig, allPrevouts runar.ByteString) {
+func (c *PairPool) Rescind(validatorSig runar.Sig, allPrevouts runar.ByteString, vaultCode runar.ByteString) {
 	runar.Assert(runar.CheckSig(validatorSig, c.ValidatorPubKey))
+	c.requireSighashAll(validatorSig)
 	c.requireVault(allPrevouts, runar.ExtractHashPrevouts(c.TxPreimage), runar.ExtractOutpoint(c.TxPreimage))
 	sats := runar.ExtractAmount(c.TxPreimage)
 	c.ValidatorPubKey = runar.Num2Bin(0, 33)
-	c.writePair(sats)
+	c.writePair(sats, vaultCode)
 }
 
 // requireVault: this pool is input 0 and output 0 of its transaction, and
@@ -204,13 +213,23 @@ func (c *PairPool) requireVault(allPrevouts runar.ByteString, hashPrevouts runar
 	runar.Assert(runar.Substr(allPrevouts, 36, 36) == runar.Cat(txid, runar.ByteString("\x01\x00\x00\x00")))
 }
 
+// requireSighashAll: the signer's signature is SIGHASH_ALL|FORKID. The
+// preimage is that type by Rúnar's own check, which pins this transaction's
+// outputs for the script; the signature's type decides what the signer has
+// agreed to. Any other type would let a third party reuse it over outputs or
+// inputs of their own (a NONE validator signature: a whole other Swap).
+func (c *PairPool) requireSighashAll(sig runar.Sig) {
+	runar.Assert(runar.Substr(sig, runar.Len(sig)-1, 1) == runar.ByteString("\x41"))
+}
+
 // writePair emits the pool continuation (output 0, holding sats) and its
 // vault (output 1, 1 sat) for the current state.
-func (c *PairPool) writePair(sats runar.Bigint) {
+func (c *PairPool) writePair(sats runar.Bigint, vaultCode runar.ByteString) {
 	runar.Assert(c.ReserveA > 0)
 	runar.Assert(c.ReserveB > 0)
+	runar.Assert(runar.Sha256(vaultCode) == c.VaultCodeHash)
 	// The vault script before poolScript's GetStateScript (it reads ReserveB).
-	vault := runar.Cat(c.tokenPrefix(c.AssetIdB, c.ReserveB), c.VaultCode)
+	vault := runar.Cat(c.tokenPrefix(c.AssetIdB, c.ReserveB), vaultCode)
 	c.AddRawOutput(sats, c.poolScript())
 	c.AddRawOutput(1, vault)
 }
