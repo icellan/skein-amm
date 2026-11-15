@@ -158,9 +158,9 @@ func (c *PairPool) Swap(validatorSig runar.Sig, nextValidatorPubKey runar.PubKey
 	change := runar.Bin2Num(runar.Num2Bin(tokenChange, 9))
 	// The next key is a compressed public key by its length and first byte:
 	// the cleared key of a rescinded pool is written by Rescind alone. (Rúnar
-	// v1 checks the 33 bytes itself when the state is written; an older Rúnar
-	// does not, and a key of another length there writes a continuation no
-	// method can spend.)
+	// v1 checks the 33 bytes itself when the state is written. An older Rúnar
+	// does not, and there a key of another length writes a continuation the
+	// LP cannot Close.)
 	runar.Assert(runar.Len(nextValidatorPubKey) == 33)
 	keyType := runar.Substr(nextValidatorPubKey, 0, 1)
 	runar.Assert(keyType == runar.ByteString("\x02") || keyType == runar.ByteString("\x03"))
