@@ -18,6 +18,15 @@ deploy is one funder transaction with the pool at output 0 and the vault at
 output 1. Every spend here has the pool at input 0 and the vault at input 1,
 unless a negative case moves them.
 
+The pool's state is fixed-width, 251 bytes: ReserveA and ReserveB (8 bytes
+each, little-endian), LpPubKey, ValidatorPubKey and ValidatorIdentity (33
+each), Nonce (32), LpFeeAPkh and LpFeeBPkh (20 each), and the validator's
+affirmation as its signature's r and s, AffirmationR and AffirmationS (32
+each). With no variable-length field the artifact has no `codePartLenSlots`:
+the deployed code is the template with its constructor args spliced in and
+nothing else. Swap and Rescind, which write a continuation, take Rúnar's
+`_codePart` witness; Close does not.
+
 The pool does not carry the vault's code: it carries `VaultCodeHash`
 (sha256 of the vault script, a readonly constructor arg), and Swap and
 Rescind take the vault code as their last declared argument (after
@@ -26,6 +35,14 @@ the hash and build output 1 from it. Close takes no vault code. The
 validator's signature (Swap, Rescind) and the LP's (Close) must be
 SIGHASH_ALL|FORKID.
 
+Swap alone also checks its inputs and the deploy: the two asset ids differ
+and no fee rate is negative (`requireSwappable`; a pair deployed wrong can
+still be rescinded and closed), the next validator key starts 02 or 03,
+`userPkh`, `commissionPkh` and `tokenChangePkh` are 20 bytes each (whether
+used or not), and `tokenChange` is at most 2^64−1 (BRC-162's largest amount) and written into its output as
+a minimal number whatever push it came in. The asset ids are Rúnar's fixed
+32-byte type.
+
 ## What it proves
 
 - Script validity of both contract inputs, the pool and the vault, under the
@@ -33,7 +50,8 @@ SIGHASH_ALL|FORKID.
   Rúnar's `integration/regtest.sh`; see the policy list below.
 - Every accepted spend's outputs are mined exactly as an independent
   expectation says (value and script, byte for byte). That covers the pool
-  continuation (token-A prefix, code, state with both reserves), the vault
+  continuation (token-A prefix, code, state with both reserves and the
+  affirmation carried byte for byte), the vault
   continuation (token-B prefix, vault code), the payout, the fee outputs,
   token change and Rúnar sats change. Each spend consumes the previous pair:
   input 0 spends the previous `txid:0`, input 1 the previous `txid:1`, and
@@ -51,9 +69,10 @@ SIGHASH_ALL|FORKID.
   involved are still unspent, and the honest spend of that pair is then
   accepted.
 - Every SDK-deployed pool's code equals a build from the artifact template
-  done without the SDK: constructor slots spliced (assetIdA, assetIdB,
-  VaultCodeHash, the three fee rates), codeSepIndex slots set to `OP_1`, and the
-  `codePartLenSlots` fields set to the deployed length. The SDK's vault
+  done without the SDK: the constructor slots (assetIdA, assetIdB,
+  VaultCodeHash, the three fee rates) replaced by the args' pushes, and
+  nothing else. A pair deployed from such spliced bytes spends through every
+  method at fee rates {0, 0, 0}, {17, 0, 0} and {30, 5, 10}. The SDK's vault
   script equals the vault artifact's script (it has no slots), and the
   suite takes `VaultCodeHash` as sha256 of it.
 - The new rules refuse what they are meant to, and only them: a wrong vault
@@ -64,6 +83,15 @@ SIGHASH_ALL|FORKID.
   valid and only the type rule refuses it. In Close the type check runs
   before the LP's signature check; there the signature's validity rests on
   the harness verifying it against its type's digest.
+- Swap's input and deploy checks refuse what they are meant to, each traced
+  to its own check: the 20-byte compares of the three addresses (the
+  commission address with and without a commission output), the 02/03 compare
+  of the next key's first byte, the `<= 2^64−1` compare of `tokenChange`, the
+  compare of the two compiled-in asset ids, and the `LpFeeBps >= 0` compare.
+  A pair of one token with itself is still rescinded and closed, and a pair
+  with a negative fee rate still closed. A next key of `02` and 32 arbitrary
+  bytes is accepted (the type byte is all Swap checks); nobody can sign for
+  it, so that pair can then neither Swap nor Rescind, and the LP closes it.
 
 ## What it does not prove
 
@@ -85,21 +113,49 @@ SIGHASH_ALL|FORKID.
 - The validator's and the overlays' rules: affirmation checks, key
   derivation, prefix == state on admission, `VaultCodeHash` being the
   canonical vault's.
+- The validator's duties the contract cannot enforce. `TestTrustModel_ChangePKHCarriesAnExtraOutput`
+  shows one on the node: Rúnar does not check the length of `_changePKH`
+  (icellan/runar#213) and serializes the change output as
+  `<amount:8> 19 76 a9 14 <_changePKH> 88 ac`, so a `_changePKH` of
+  `<20-byte hash> 88 ac <value:8> <varint len> <script minus its last two
+  bytes>` commits the transaction to the change output and one more output
+  after it. The node accepts and mines that Swap; nothing in its standardness
+  policy objects. Only the validator's refusal to sign stops it.
 - The 32-byte `nextValidatorPubKey` case builds its continuation with the
   short key in state. That shows the node refuses this spend, not that no
   continuation could pass.
+- That a non-minimal `tokenChange` push is written minimally, on this node.
+  The script does it (the go-sdk interpreter, under consensus rules, passes
+  such a Swap whose change output carries the minimal number), but the node
+  refuses the transaction first, on policy:
+  `non-mandatory-script-verify-flag (Non-minimally encoded script number)`
+  (MINIMALDATA, enforced at mempool entry because `regtest.sh` sets
+  `acceptnonstdtxn=0`). `TestStrictTokenChangeNonMinimalPush` keeps that as an
+  honest spend refused by policy, then shows the same change pushed minimally
+  is accepted and mined as the minimal push. Only a miner that takes
+  non-standard transactions would see the script's re-encoding at work.
+- That a Close with a stray `_codePart` push (as Close took while the state
+  was variable-length) is refused on consensus. It is not: the push stays on
+  the stack under the result, which consensus allows after Genesis; the node
+  refuses it on policy, `non-mandatory-script-verify-flag (Script did not
+  clean its stack)` (CLEANSTACK). `TestCloseWithStrayCodePart` asserts exactly
+  that, then the LP's Close without the push is accepted.
 
 ## Running
 
-You need Docker and a Rúnar checkout. By default the checkout is the sibling
-`../../../../runar` (next to the main skein-amm checkout); otherwise set
-`RUNAR_DIR`.
+You need Docker and a Rúnar checkout at main 6bd5e29f4 or later (Rúnar v1;
+the contract's header says why). `RUNAR_DIR` names it; the default is
+`../../../../runar`, the sibling of the skein-amm checkout this directory is
+in (from a worktree under `.worktrees/` that path points elsewhere). `run.sh`
+checks the checkout contains 6bd5e29f4 and stops with a message if it does
+not, rather than compile with an older Rúnar: a sibling checkout that is
+not kept up to date is the usual way that happens.
 
 ```sh
 cd pool/pair/regtest
 ./run.sh -v                       # starts the skein-pair node if needed, runs everything, leaves it running
-./run.sh -run HandSpliced -v
-./run.sh --pinned -v              # compile with the Rúnar the root go.mod pins instead of the checkout
+./run.sh -run Strict -v
+./run.sh --pinned -v              # compile with the Rúnar the root go.mod pins (older than v1) instead of the checkout
 FEE_RATE_SAT_PER_KB=1 ./run.sh -v # the node's floor
 ./run.sh --stop                   # run everything, then stop the node
 ```
@@ -141,21 +197,22 @@ counts.
 
 ## Sizes
 
-At Rúnar main (6bd5e29f4), fees {30, 5, 10}, 70-byte affirmation; the fee
-is at the default 100 sat/kB (at 1 sat/kB: 6, 18, 18, 18 and 12 sats). The
+At Rúnar main (6bd5e29f4), fees {30, 5, 10}; the fee is at the default
+100 sat/kB (at 1 sat/kB: 6, 17, 17, 17 and 7 sats). The
 unlock columns are the pool's and the vault's unlocking scripts.
 
 | | tx bytes | pool unlock | vault unlock | fee |
 |---|---|---|---|---|
-| deploy (pool 4987-byte script, code 4689; vault 553-byte script) | 5752 | | | 576 |
-| Swap | 17714 | 10661 | 821 | 1773 |
-| Swap with token change and Rúnar sats change | 17823 | 10666 | 821 | 1783 |
-| Rescind (with Rúnar change) | 17150 | 10526 | 785 | 1716 |
-| Close | 11155 | 9983 | 785 | 1116 |
+| deploy (pool 4670-byte script, code 4380; vault 553-byte script) | 5436 | | | 544 |
+| Swap | 16774 | 10037 | 821 | 1678 |
+| Swap with token change and Rúnar sats change | 16881 | 10040 | 821 | 1689 |
+| Rescind (with Rúnar change) | 16209 | 9901 | 785 | 1622 |
+| Close | 6148 | 4975 | 785 | 616 |
 
-The pool unlock carries `_codePart` (the code), the preimage (whose
-scriptCode is the pool script again) and, for Swap and Rescind, the vault
-code (518 bytes pushed).
+Swap's and Rescind's pool unlock carries `_codePart` (the code), the
+preimage (whose scriptCode is the pool script again) and the vault code (518
+bytes pushed). Close's carries only the signature, `allPrevouts` and the
+preimage.
 
 ## The cases
 
@@ -165,7 +222,7 @@ code (518 bytes pushed).
 | fee pair {30, 5, 10}: A-in, B-in, a Swap with token change and Rúnar sats change, 10 chained swaps alternating direction with validator key rotation, Rescind (with Rúnar change), Close sweeping both tokens to token-prefixed P2PKH | `TestLifecycleFeePair` |
 | zero-fee pair {0, 0, 0}: both directions (3 outputs each), Close | `TestZeroFeePair` |
 | Close on a fresh pair; Close after swaps without Rescind | `TestCloseFreshPair`, `TestCloseAfterSwapsWithoutRescind` |
-| affirmation 0, 71, 72 bytes: deploy, Swap, Rescind, Close | `TestAffirmationSizes` |
+| the affirmation a real signature's r and s: deploy, Swap, Rescind, Close, each mined pool script ending in exactly r \|\| s | `TestRealAffirmation` |
 | a pool deployed with 5,000 sats keeps them through Swaps and Rescind; Close sweeps them | `TestPairWithMoreSats` |
 | Swap refused (the pool fails, the vault passes): payout +1 (both directions), vault one token short, vault replaced by a token-B P2PKH, vault missing, pool/vault outputs swapped, wrong validator key, validator fee missing, extra output, ReserveB in state one more than the vault's prefix, 32-byte next key | `TestSwapRejected` |
 | Swap refused: continuation 1 sat short of a 5,000-sat pool, the sat routed to Rúnar change | `TestSwapRejected_PoolSatSkimmed` |
@@ -175,33 +232,13 @@ code (518 bytes pushed).
 | Rescind refused: LP-signed; second Rescind; Swap after Rescind | `TestRescindRejected` |
 | wrong `vaultCode` for Swap and for Rescind (the vault's code with its last byte flipped; a stranger's P2PKH), each with output 1 built from it and with output 1 the real vault (the pool fails) | `TestVaultCodeArgumentRejected` |
 | Swap, Rescind and Close each signed with a valid NONE\|FORKID and a valid ALL\|ANYONECANPAY\|FORKID signature (the pool fails at the `0x41` compare; the trace is checked) | `TestSignerSighashTypeRejected` |
-| hand-spliced template (fund lock of both tokens) | `TestHandSplicedTemplate_FundLock` |
-
-### The hand-spliced template
-
-At Rúnar main (6bd5e29f4), PairPool's code has three `verify_code_part_len`
-fields (`04 <len:4 LE> OP_BIN2NUM OP_NUMEQUAL OP_VERIFY`). The artifact
-template (4368 bytes) holds a compile-time lower bound in them (4432), and
-only the SDK writes the deployed length (4689 bytes at fees {30, 5, 10},
-4688 at {0, 0, 0}).
-
-`TestHandSplicedTemplate_FundLock` builds pool code from the template the
-way a non-SDK builder would: constructor slots spliced, codeSepIndex slots
-set to `OP_1`, length fields left alone. It deploys one pair per method,
-under fee sets {30, 5, 10} and {0, 0, 0}, and tries two spends on each:
-
-- the honest spend;
-- `_codePart` truncated to the pinned length. Rúnar authenticates
-  `_codePart` as `61ab || scriptCode[0:SIZE-2]`, so at the pinned SIZE this
-  is the only `_codePart` that can pass.
-
-Only the pool input is expected to fail. The vault moves only with its pool,
-so if the node refuses both spends for Swap, Rescind and Close, neither
-token can be recovered: the test passes and logs `FUNDS LOCKED`. If any of
-them is accepted, the test fails. The last subtest writes the real code
-length into the three fields, checks the result equals the SDK's bytes
-exactly, and spends that pair through Swap both ways, Rescind and Close.
-
-With a Rúnar whose artifact has no `codePartLenSlots` (the pinned one), the
-test instead asserts the hand splice equals the SDK's code, and that it
-spends.
+| Swap refused by its input checks (the pool fails): `userPkh` of 19 and of 21 bytes (payout written as the contract would); `commissionPkh` of 19 bytes with a commission and on a zero-fee pair without one; `tokenChangePkh` of 21 bytes with a token change; next key of 33 zero bytes, `04` + 32 bytes, `07` + 32 bytes; `tokenChange` 2^64 with its output; `tokenChange` 17 pushed as `02 11 00` with the output carrying that push | `TestStrictSwapRejected` |
+| `tokenChange` 17 pushed as `02 11 00`, the output minimal: refused by the node's policy only (both inputs pass on consensus rules); then pushed minimally: accepted, mined as `01 11` | `TestStrictTokenChangeNonMinimalPush` |
+| next key `02` + 32 arbitrary bytes accepted; then a Swap and a Rescind refused; Close accepted | `TestStrictNextKeyTypeByteOnly` |
+| a pair with `AssetIdA == AssetIdB`: Swap refused both ways; Rescind and Close accepted | `TestStrictSameToken` |
+| a pair with fee rates {−30, 0, 0}: Swap refused (outputs as the script's arithmetic gives: no fee output, net 40,119 for 40,000 in); Close accepted | `TestStrictNegativeFeeRate` |
+| `tokenChange` 2^63 and 2^64−1 (BRC-162's largest amount), pushed minimally: accepted, the change output mined with that push | `TestStrictTokenChangeLargeAmounts` |
+| a continuation with AffirmationR or AffirmationS one byte off (Swap; Rescind): refused (the pool fails) | `TestAffirmationCarriedRejected` |
+| a Close with a stray `_codePart` push: both inputs pass on consensus rules, the node refuses it on policy (CLEANSTACK); the Close without it accepted | `TestCloseWithStrayCodePart` |
+| trust model: a 54-byte `_changePKH` carrying an extra output after the change: accepted and mined (the validator must refuse to sign it) | `TestTrustModel_ChangePKHCarriesAnExtraOutput` |
+| the template with its constructor args spliced, without the SDK, at fees {0, 0, 0}, {17, 0, 0}, {30, 5, 10}: the SDK's bytes, and it spends through every method | `TestSplicedTemplateEqualsSDK` |

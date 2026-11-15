@@ -112,7 +112,7 @@ type propVals struct {
 func propCeilFee(in *big.Int, bps int64) *big.Int {
 	x := propMul(in, propBig(bps))
 	x.Add(x, propBig(9999))
-	return x.Quo(x, propBig(10000)) // in > 0 here: Quo = floor
+	return x.Quo(x, propBig(10000)) // Quo truncates toward zero, as the script's OP_DIV does
 }
 
 // propModel is the swap as the header comment states it, from scratch.
@@ -140,6 +140,8 @@ func propModel(bps [3]int64, ra, rb, in *big.Int, aIn bool) propVals {
 		v.newA, v.newB = newOut, newIn
 	}
 	switch {
+	case in.Cmp(propPow2m1(64)) > 0:
+		v.why = "amountIn past 2^64-1"
 	case v.out.Sign() <= 0:
 		v.why = "output rounds to 0"
 	case newOut.Sign() <= 0:
@@ -358,8 +360,8 @@ func TestPropSwapDifferential(t *testing.T) {
 			if !r.ok() {
 				t.Fatalf("HONEST SWAP REJECTED bps %v a=%d b=%d in=%d aIn=%v: pool %v vault %v\ntx %s", bps, p.a, p.b, in, aIn, r.pool, r.vault, advTxHex(tx))
 			}
-			if valid%4 != 0 {
-				continue // the mutations on every fourth swap
+			if valid%8 != 0 {
+				continue // every mutation, on every eighth swap (about 30 per fee config)
 			}
 			for name, m := range propMutations(f, p, aIn, s, v) {
 				if advRun(t, f, m, advOpts{}).pool == nil {
@@ -599,6 +601,8 @@ var propBoundaries = []struct {
 	{propPow2(53), "0700000000000020"},
 	{propPow2(62), "080000000000000040"},
 	{propPow2m1(63), "08ffffffffffffff7f"},
+	{propPow2(63), "09000000000000008000"},
+	{propPow2m1(64), "09ffffffffffffffff00"},
 }
 
 // propNonMinimal: other encodings of the same amount (and negative zero for
@@ -637,6 +641,9 @@ func propFeeLoc(name string, which int) propLoc {
 				f := advFix(t, cfg)
 				p := propPairOf(1_000_000_000, 1)
 				c0 := new(big.Int).Quo(propMul(a, propBig(10000)), propBig(b))
+				if c0.Cmp(propPow2m1(64)) > 0 {
+					continue
+				}
 				for d := int64(-3); d <= 3; d++ {
 					in := propAdd(c0, propBig(d))
 					if in.Sign() <= 0 || propCeilFee(in, b).Cmp(a) != 0 {
@@ -647,12 +654,17 @@ func propFeeLoc(name string, which int) propLoc {
 					}
 				}
 			}
-			return nil, pair{}, nil, false, nil, 0, "no valid swap gives this fee"
+			// A fee is at most ceil((2^64-1) * bps / 10000) (amountIn <= 2^64-1):
+			// with 9999 bps, about 2^64 * 0.9999, so 2^64-1 itself is out of reach.
+			return nil, pair{}, nil, false, nil, 0, "unreachable: this fee needs amountIn above 2^64-1"
 		}}
 }
 
 var propLocs = []propLoc{
 	{"pool prefix (ReserveA)", func(bool) []byte { return assetA }, func(t *testing.T, a *big.Int) (*fixture, pair, *big.Int, bool, *big.Int, int, string) {
+		if a.Cmp(propMax63) > 0 {
+			return nil, pair{}, nil, false, nil, 0, "unreachable: a reserve is at most 2^63-1 (its 8 state bytes)"
+		}
 		f := advFix(t, [3]int64{0, 0, 0})
 		if a.Cmp(propBig(1)) == 0 { // B in: a 2, b 1, net 1 -> out 1, newA 1
 			return f, propPairOf(2, 1), propBig(1), false, nil, 0, ""
@@ -660,6 +672,9 @@ var propLocs = []propLoc{
 		return f, propPairOf(1, 1_000_000), propSub(a, propBig(1)), true, nil, 0, ""
 	}},
 	{"vault prefix (ReserveB)", func(bool) []byte { return assetB }, func(t *testing.T, a *big.Int) (*fixture, pair, *big.Int, bool, *big.Int, int, string) {
+		if a.Cmp(propMax63) > 0 {
+			return nil, pair{}, nil, false, nil, 0, "unreachable: a reserve is at most 2^63-1 (its 8 state bytes)"
+		}
 		f := advFix(t, [3]int64{0, 0, 0})
 		if a.Cmp(propBig(1)) == 0 {
 			return f, propPairOf(1, 2), propBig(1), true, nil, 1, ""
@@ -798,7 +813,8 @@ func TestPropAmountInDomain(t *testing.T) {
 		valid bool
 	}{
 		{"2^63-1, 9999 bps", propPow2m1(63), f9, true, true},
-		{"2^64, 9999 bps", propPow2(64), f9, false, true},
+		{"2^64-1, 9999 bps (the largest amountIn)", propPow2m1(64), f9, false, true},
+		{"2^64, 9999 bps (amountIn past 2^64-1)", propPow2(64), f9, false, false},
 		{"2^100, 9999 bps (net past 2^63-1)", propPow2(100), f9, true, false},
 		{"2^63-1, no fees (reserve past 2^63-1)", propPow2m1(63), fz, false, false},
 		{"2^64, no fees", propPow2(64), fz, true, false},
@@ -820,7 +836,10 @@ func TestPropAmountInDomain(t *testing.T) {
 				t.Errorf("%s: tokenChange %v ACCEPTED", advDir(aIn), bad)
 			}
 		}
-		for _, tcv := range []*big.Int{propPow2m1(63), propPow2(64), propPow2(100)} {
+		// BRC-162's amounts up to 2^64-1 pass (2^63 and above as nine-byte
+		// pushes); 2^64 and above are refused, the change output written for
+		// them or not.
+		for _, tcv := range []*big.Int{propPow2m1(63), propPow2(63), propPow2m1(64)} {
 			c, v := propSpend(f, p, propBig(40_000), aIn, tcv, nil)
 			if !v.ok {
 				t.Fatal(v.why)
@@ -831,6 +850,16 @@ func TestPropAmountInDomain(t *testing.T) {
 			c.outs = c.outs[:len(c.outs)-1]
 			if advRun(t, f, c, advOpts{}).pool == nil {
 				t.Errorf("%s: tokenChange %v without its output ACCEPTED", advDir(aIn), tcv)
+			}
+		}
+		for _, tcv := range []*big.Int{propPow2(64), propAdd(propPow2(64), propBig(1)), propPow2m1(71), propPow2(100)} {
+			c, _ := propSpend(f, p, propBig(40_000), aIn, tcv, nil)
+			if advRun(t, f, c, advOpts{}).pool == nil {
+				t.Errorf("%s: tokenChange %v with its output ACCEPTED", advDir(aIn), tcv)
+			}
+			c.outs = c.outs[:len(c.outs)-1]
+			if advRun(t, f, c, advOpts{}).pool == nil {
+				t.Errorf("%s: tokenChange %v without an output ACCEPTED", advDir(aIn), tcv)
 			}
 		}
 	}

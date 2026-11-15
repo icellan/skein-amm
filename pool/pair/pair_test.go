@@ -32,10 +32,13 @@ const (
 )
 
 var (
-	assetA            = bytes.Repeat([]byte{0xa5}, 32)
-	assetB            = bytes.Repeat([]byte{0xb6}, 32)
-	nonce             = bytes.Repeat([]byte{0x4e}, 32)
-	affirmation       = append([]byte{0x30, 0x44}, bytes.Repeat([]byte{0x02}, 0x44)...)
+	assetA = bytes.Repeat([]byte{0xa5}, 32)
+	assetB = bytes.Repeat([]byte{0xb6}, 32)
+	nonce  = bytes.Repeat([]byte{0x4e}, 32)
+	// The affirmation every pool carries in state: stand-ins for the
+	// validator's signature's r and s (the contract never checks them).
+	affirmationR      = bytes.Repeat([]byte{0x72}, 32)
+	affirmationS      = bytes.Repeat([]byte{0x73}, 32)
 	validatorIdentity = key(0x7f)
 	lpFeeAPkh         = bytes.Repeat([]byte{0x66}, 20)
 	lpFeeBPkh         = bytes.Repeat([]byte{0x77}, 20)
@@ -130,14 +133,17 @@ func (p pair) state() []byte {
 	s = append(s, nonce...)
 	s = append(s, lpFeeAPkh...)
 	s = append(s, lpFeeBPkh...)
-	s = append(s, byte(len(affirmation)))
-	return append(s, affirmation...)
+	s = append(s, affirmationR...)
+	return append(s, affirmationS...)
 }
 
 type fixture struct {
 	code  []byte // the pool's code with its readonly args (no prefix, no state)
 	vault []byte // the vault's code
 	bps   [3]int64
+	// the two asset ids compiled into the code (assetA and assetB unless a
+	// test deploys others)
+	idA, idB []byte
 }
 
 func artifact(t testing.TB, src string) *runar.RunarArtifact {
@@ -159,6 +165,12 @@ func artifact(t testing.TB, src string) *runar.RunarArtifact {
 
 func newFixture(t testing.TB, lpBps, valBps, comBps int64) *fixture {
 	t.Helper()
+	return newFixtureIDs(t, assetA, assetB, lpBps, valBps, comBps)
+}
+
+// newFixtureIDs is newFixture for a pair of the two given asset ids.
+func newFixtureIDs(t testing.TB, idA, idB []byte, lpBps, valBps, comBps int64) *fixture {
+	t.Helper()
 	vault, _ := hex.DecodeString(runar.NewRunarContract(artifact(t, "Vault.runar.go"), nil).GetLockingScript())
 	vaultHash := sha256.Sum256(vault)
 	p := pair{sats: 1, a: 1000, b: 1000, lp: key(1), validator: key(2)}
@@ -170,9 +182,10 @@ func newFixture(t testing.TB, lpBps, valBps, comBps int64) *fixture {
 		hex.EncodeToString(nonce),
 		hex.EncodeToString(lpFeeAPkh),
 		hex.EncodeToString(lpFeeBPkh),
-		hex.EncodeToString(affirmation),
-		hex.EncodeToString(assetA),
-		hex.EncodeToString(assetB),
+		hex.EncodeToString(affirmationR),
+		hex.EncodeToString(affirmationS),
+		hex.EncodeToString(idA),
+		hex.EncodeToString(idB),
 		hex.EncodeToString(vaultHash[:]),
 		lpBps, valBps, comBps,
 	})
@@ -181,17 +194,17 @@ func newFixture(t testing.TB, lpBps, valBps, comBps int64) *fixture {
 	if !bytes.HasSuffix(full, tail) {
 		t.Fatalf("SDK state layout differs from pair.state(): %x", full[len(full)-len(tail):])
 	}
-	return &fixture{code: full[:len(full)-len(tail)], vault: vault, bps: [3]int64{lpBps, valBps, comBps}}
+	return &fixture{code: full[:len(full)-len(tail)], vault: vault, bps: [3]int64{lpBps, valBps, comBps}, idA: idA, idB: idB}
 }
 
 func (f *fixture) poolLock(p pair) []byte {
-	s := append(tokenPrefix(assetA, p.a), f.code...)
+	s := append(tokenPrefix(f.idA, p.a), f.code...)
 	s = append(s, 0x6a)
 	return append(s, p.state()...)
 }
 
 func (f *fixture) vaultLock(p pair) []byte {
-	return append(tokenPrefix(assetB, p.b), f.vault...)
+	return append(tokenPrefix(f.idB, p.b), f.vault...)
 }
 
 type out struct {
@@ -307,7 +320,10 @@ func (f *fixture) run(t testing.TB, s spend) result {
 		if prevouts == nil {
 			prevouts = real
 		}
-		u := pushData(f.code) // _codePart
+		var u []byte
+		if s.method != methodClose {
+			u = pushData(f.code) // _codePart: the methods that write a continuation
+		}
 		u = append(u, pushData(append(sig.Serialize(), byte(sigFlag)))...)
 		for _, a := range s.args {
 			u = append(u, a...)
@@ -363,7 +379,7 @@ type swapResult struct {
 func ceilFee(amountIn, bps int64) *big.Int {
 	x := new(big.Int).Mul(big.NewInt(amountIn), big.NewInt(bps))
 	x.Add(x, big.NewInt(9999))
-	return x.Div(x, big.NewInt(10000))
+	return x.Quo(x, big.NewInt(10000)) // truncating toward zero, as the script's division
 }
 
 func (f *fixture) model(p pair, amountIn int64, aIn bool, nextValidator *ec.PrivateKey) swapResult {
@@ -470,14 +486,6 @@ func mustPass(t *testing.T, r result) {
 	}
 	if r.vault != nil {
 		t.Fatalf("vault input rejected: %v", r.vault)
-	}
-}
-
-// mustFail: the transaction is invalid, i.e. at least one contract input rejects it.
-func mustFail(t *testing.T, r result) {
-	t.Helper()
-	if r.ok() {
-		t.Fatal("accepted, expected a rejection")
 	}
 }
 
@@ -658,54 +666,56 @@ func TestSwapDifferential(t *testing.T) {
 	}
 }
 
+// shapedSwap builds the transaction the script's own arithmetic gives for
+// net entering and paid leaving, with no fee outputs: the outputs the
+// contract itself would write, so a refusal is the guard's and not a
+// hashOutputs mismatch. amountIn is the raw push.
+func shapedSwap(f *fixture, p pair, amountIn []byte, aIn bool, net, paid int64) spend {
+	after := p
+	after.validator = key(p.validator.Serialize()[0] + 1)
+	outAsset := assetB
+	if aIn {
+		after.a, after.b = p.a+net, p.b-paid
+	} else {
+		after.a, after.b = p.a-paid, p.b+net
+		outAsset = assetA
+	}
+	return spend{
+		ins: f.ins(p), poolIdx: 0, vaultIdx: 1,
+		outs: []out{
+			{p.sats, f.poolLock(after)},
+			{1, f.vaultLock(after)},
+			{1, tokenP2pkh(outAsset, paid, userPkh)},
+		},
+		method: methodSwap, signer: p.validator,
+		args: [][]byte{
+			pushData(after.validator.PubKey().Compressed()),
+			amountIn,
+			pushBool(aIn),
+			pushData(userPkh),
+			pushData(commissionPkh),
+			pushData(changePkh),
+			pushNum(0),
+		},
+	}
+}
+
 // Swaps the contract must refuse, with the outputs the contract itself would
 // build for them (so the refusal is the guard's, not a hashOutputs mismatch).
 func TestSwapRejects(t *testing.T) {
-	// shaped builds the transaction the script's own arithmetic gives for
-	// net entering and paid leaving, no fee outputs.
-	shaped := func(f *fixture, p pair, amountIn []byte, aIn bool, net, paid int64) spend {
-		after := p
-		after.validator = key(p.validator.Serialize()[0] + 1)
-		outAsset := assetB
-		if aIn {
-			after.a, after.b = p.a+net, p.b-paid
-		} else {
-			after.a, after.b = p.a-paid, p.b+net
-			outAsset = assetA
-		}
-		return spend{
-			ins: f.ins(p), poolIdx: 0, vaultIdx: 1,
-			outs: []out{
-				{p.sats, f.poolLock(after)},
-				{1, f.vaultLock(after)},
-				{1, tokenP2pkh(outAsset, paid, userPkh)},
-			},
-			method: methodSwap, signer: p.validator,
-			args: [][]byte{
-				pushData(after.validator.PubKey().Compressed()),
-				amountIn,
-				pushBool(aIn),
-				pushData(userPkh),
-				pushData(commissionPkh),
-				pushData(changePkh),
-				pushNum(0),
-			},
-		}
-	}
-
 	free := newFixture(t, 0, 0, 0)
 	t.Run("output rounds to zero, A in", func(t *testing.T) {
 		p := pair{sats: 1, a: 1 << 40, b: 10, lp: key(10), validator: key(20)}
-		mustFailPool(t, free.run(t, shaped(free, p, pushNum(1000), true, 1000, 0)))
+		mustFailPool(t, free.run(t, shapedSwap(free, p, pushNum(1000), true, 1000, 0)))
 	})
 	t.Run("output rounds to zero, B in", func(t *testing.T) {
 		p := pair{sats: 1, a: 10, b: 1 << 40, lp: key(10), validator: key(20)}
-		mustFailPool(t, free.run(t, shaped(free, p, pushNum(1000), false, 1000, 0)))
+		mustFailPool(t, free.run(t, shapedSwap(free, p, pushNum(1000), false, 1000, 0)))
 	})
 	t.Run("control: the same shape with a payout of 1 passes", func(t *testing.T) {
 		p := pair{sats: 1, a: 1000, b: 10, lp: key(10), validator: key(20)}
 		// net 1000: out = 1000*10/2000 = 5
-		mustPass(t, free.run(t, shaped(free, p, pushNum(1000), true, 1000, 5)))
+		mustPass(t, free.run(t, shapedSwap(free, p, pushNum(1000), true, 1000, 5)))
 	})
 
 	// Fee rates summing over 100%: a negative amountIn has negative fees
@@ -717,7 +727,7 @@ func TestSwapRejects(t *testing.T) {
 		// amountIn -10000: each fee (-10000*9999+9999)/10000 = -9998; net 9996.
 		const net = 9996
 		outB := net * p.b / (p.a + net)
-		mustFailPool(t, over.run(t, shaped(over, p, []byte{0x02, 0x10, 0xa7}, true, net, outB)))
+		mustFailPool(t, over.run(t, shapedSwap(over, p, []byte{0x02, 0x10, 0xa7}, true, net, outB)))
 	})
 
 	f := newFixture(t, 30, 5, 10)

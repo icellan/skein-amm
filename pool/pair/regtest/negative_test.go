@@ -24,7 +24,7 @@ import (
 func TestSwapRejected(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	pr := e.deploySDK(newParams(t, 30, 5, 10, 71), newPairState(t))
+	pr := e.deploySDK(newParams(t, 30, 5, 10), newPairState(t))
 
 	cases := []struct {
 		name   string
@@ -100,7 +100,7 @@ func TestSwapRejected_PoolSatSkimmed(t *testing.T) {
 	e := newEnv(t)
 	st := newPairState(t)
 	st.sats = 5_000
-	pr := e.deploySDK(newParams(t, 30, 5, 10, 71), st)
+	pr := e.deploySDK(newParams(t, 30, 5, 10), st)
 	plan := func() (*swapPlan, *spend) {
 		r := planSwap(t, pr, 20_000, true)
 		r.satsChangePkh, r.satsChange = pkh(newKey(t)), 1_000
@@ -151,7 +151,7 @@ func pairingCases(foreign *pair) []struct {
 func TestPairingRejected(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	foreign := e.deploySDK(newParams(t, 30, 5, 10, 71), newPairState(t))
+	foreign := e.deploySDK(newParams(t, 30, 5, 10), newPairState(t))
 	methods := []struct {
 		name   string
 		honest func(t *testing.T, pr *pair) *spend
@@ -167,7 +167,7 @@ func TestPairingRejected(t *testing.T) {
 	for _, m := range methods {
 		t.Run(m.name, func(t *testing.T) {
 			e := e.sub(t)
-			pr := e.deploySDK(newParams(t, 30, 5, 10, 71), newPairState(t))
+			pr := e.deploySDK(newParams(t, 30, 5, 10), newPairState(t))
 			for _, c := range pairingCases(foreign) {
 				t.Run(c.name, func(t *testing.T) {
 					s := m.honest(t, pr)
@@ -190,8 +190,8 @@ func TestPairingRejected(t *testing.T) {
 func TestVaultTheftRejected(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	v := e.deploySDK(newParams(t, 30, 5, 10, 71), newPairState(t))
-	x := e.deploySDK(newParams(t, 30, 5, 10, 71), newPairState(t))
+	v := e.deploySDK(newParams(t, 30, 5, 10), newPairState(t))
+	x := e.deploySDK(newParams(t, 30, 5, 10), newPairState(t))
 	thief := newKey(t)
 	steal := out{1, tokenP2pkh(v.p.assetB, v.st.b, pkh(thief))}
 
@@ -252,7 +252,7 @@ func TestVaultTheftRejected(t *testing.T) {
 func TestCloseRejected(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	pr := e.deploySDK(newParams(t, 30, 5, 10, 71), newPairState(t))
+	pr := e.deploySDK(newParams(t, 30, 5, 10), newPairState(t))
 	for name, k := range map[string]func() *ec.PrivateKey{
 		"signed by the validator": func() *ec.PrivateKey { return pr.st.validator },
 		"signed by a random key":  func() *ec.PrivateKey { return newKey(t) },
@@ -272,7 +272,7 @@ func TestCloseRejected(t *testing.T) {
 func TestRescindRejected(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	pr := e.deploySDK(newParams(t, 30, 5, 10, 71), newPairState(t))
+	pr := e.deploySDK(newParams(t, 30, 5, 10), newPairState(t))
 	t.Run("signed by the LP", func(t *testing.T) {
 		s := rescindSpend(t, pr, 0)
 		s.label = "BAD rescind: LP-signed"
@@ -306,7 +306,7 @@ func TestRescindRejected(t *testing.T) {
 func TestVaultCodeArgumentRejected(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	pr := e.deploySDK(newParams(t, 30, 5, 10, 71), newPairState(t))
+	pr := e.deploySDK(newParams(t, 30, 5, 10), newPairState(t))
 	codes := []struct {
 		name string
 		code func() []byte
@@ -357,7 +357,7 @@ func TestVaultCodeArgumentRejected(t *testing.T) {
 func TestSignerSighashTypeRejected(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	pr := e.deploySDK(newParams(t, 30, 5, 10, 71), newPairState(t))
+	pr := e.deploySDK(newParams(t, 30, 5, 10), newPairState(t))
 	flags := []struct {
 		name string
 		flag sighash.Flag
@@ -427,4 +427,60 @@ func checkSighashAllRefused(t *testing.T, method string, d *tracer, signerPub []
 		t.Errorf("Close: the LP's key was checked before requireSighashAll: %v", d.checksigs)
 	}
 	t.Logf("%s: the signer's signature check %s before requireSighashAll refused it", method, map[bool]string{true: "SUCCEEDED", false: "was not reached"}[signerChecked])
+}
+
+// The affirmation (AffirmationR, AffirmationS) is carried unchanged: a
+// continuation with either field one byte off is refused (the pool fails).
+func TestAffirmationCarriedRejected(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	pr := e.deploySDK(newParams(t, 30, 5, 10), newPairState(t))
+	// flip changes one byte of output 0's last 64 bytes: AffirmationR at
+	// fromEnd 64..33, AffirmationS at 32..1.
+	flip := func(s *spend, fromEnd int) {
+		sc := append([]byte{}, s.outs[0].script...)
+		sc[len(sc)-fromEnd] ^= 0x01
+		s.outs[0].script = sc
+	}
+	for _, c := range []struct {
+		name    string
+		fromEnd int
+	}{{"AffirmationR, first byte", 64}, {"AffirmationS, last byte", 1}} {
+		t.Run("Swap: "+c.name+" off by one bit", func(t *testing.T) {
+			s := swapSpend(pr, planSwap(t, pr, 20_000, true))
+			s.label = "BAD swap: continuation " + c.name + " changed"
+			flip(s, c.fromEnd)
+			s.trace = true
+			e.sub(t).reject(s, consensusReject, 0)
+			e.sub(t).swap(pr, planSwap(t, pr, 20_000, true))
+		})
+	}
+	t.Run("Rescind: AffirmationR, last byte off by one bit", func(t *testing.T) {
+		s := rescindSpend(t, pr, 0)
+		s.label = "BAD rescind: continuation AffirmationR changed"
+		flip(s, 33)
+		s.trace = true
+		e.sub(t).reject(s, consensusReject, 0)
+		e.sub(t).rescind(pr, 0)
+	})
+	e.close(pr)
+}
+
+// A Close carrying a _codePart push first, as Close did while the state had a
+// variable-length field. Close takes no such witness now, so the push stays
+// on the stack under the method's result. On consensus rules both inputs
+// pass (the interpreter pre-flight: post-Genesis, CLEANSTACK is not a
+// consensus rule); the node refuses it on policy (CLEANSTACK, enforced at
+// mempool entry with acceptnonstdtxn=0). The pair is untouched, and the
+// LP's Close without the push is accepted.
+func TestCloseWithStrayCodePart(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	pr := e.deploySDK(newParams(t, 30, 5, 10), newPairState(t))
+	s := closeSpend(t, pr)
+	s.label = "POLICY-REFUSED close: a stray _codePart push"
+	s.ins[0].strayCodePart = true
+	reason := e.reject(s, "non-mandatory-script-verify-flag (Script did not clean its stack)") // no input fails on consensus rules
+	t.Logf("a stray _codePart on Close: consensus rules pass both inputs; the node refuses it on policy: %s", reason)
+	e.close(pr)
 }

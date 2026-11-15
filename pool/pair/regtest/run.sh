@@ -9,7 +9,8 @@
 # version the root go.mod pins (from the Go module cache / proxy) instead of
 # the sibling checkout.
 #
-# Env: RUNAR_DIR (default ../../../../runar), INSTANCE (default skein-pair;
+# Env: RUNAR_DIR (default ../../../../runar; must contain Rúnar commit
+# 6bd5e29f4, or the run stops), INSTANCE (default skein-pair;
 # "default" = regtest.sh's unnamed instance on 18332), RPC_URL (default
 # derived from INSTANCE), FEE_RATE_SAT_PER_KB (default 100).
 set -euo pipefail
@@ -32,6 +33,22 @@ if [ ! -x "$RUNAR_DIR/integration/regtest.sh" ]; then
   exit 1
 fi
 RUNAR_DIR="$(cd "$RUNAR_DIR" && pwd)"
+
+# The contracts need Rúnar v1: main at $RUNAR_MIN or later. Refuse to compile
+# against an older checkout (the default path can resolve to a stale sibling)
+# instead of silently building with an old compiler. --pinned compiles with
+# the module the root go.mod pins, not RUNAR_DIR, so only regtest.sh comes
+# from the checkout then.
+RUNAR_MIN=6bd5e29f4b2cfe540e510069cf4a38deecd3863a
+if [ "$pinned" = 0 ]; then
+  if ! git -C "$RUNAR_DIR" cat-file -e "$RUNAR_MIN^{commit}" 2>/dev/null ||
+    ! git -C "$RUNAR_DIR" merge-base --is-ancestor "$RUNAR_MIN" HEAD; then
+    head_rev=$(git -C "$RUNAR_DIR" log -1 --format=%h 2>/dev/null || echo "not a git checkout")
+    echo "Rúnar at $RUNAR_DIR ($head_rev) does not contain $RUNAR_MIN: the contracts need Rúnar main at $RUNAR_MIN or later." >&2
+    echo "Set RUNAR_DIR to such a checkout." >&2
+    exit 1
+  fi
+fi
 
 INSTANCE="${INSTANCE:-skein-pair}"
 if [ "$INSTANCE" = "default" ]; then

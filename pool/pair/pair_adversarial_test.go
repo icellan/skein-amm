@@ -47,11 +47,11 @@ type advOpts struct {
 	method    []byte   // a raw push in place of the method index
 	leading   [][]byte // pushes below _codePart
 	trailing  [][]byte // pushes after the method index
-	codePart  []byte   // replaces _codePart (nil: f.code)
+	codePart  []byte   // replaces _codePart (nil: f.code); on Close, pushed as an extra first push
 	chPkh     []byte   // a raw push in place of _changePKH
 	chAmt     []byte   // a raw push in place of _changeAmount
 	rawPrev   []byte   // a raw push in place of the pool's allPrevouts push
-	rawCode   []byte   // a raw push in place of the _codePart push
+	rawCode   []byte   // a raw push in place of the _codePart push (on Close, an extra first push)
 	rawVault  []byte   // a raw push in place of the vaultCode push (Swap, Rescind)
 	noVault   bool     // omit the vaultCode push (Swap, Rescind)
 	noPre     bool     // omit the pool's preimage push
@@ -103,6 +103,23 @@ func advPreimage(t testing.TB, tx *transaction.Transaction, idx int, sats int64,
 	return pre
 }
 
+// advScriptCode is afterSeparator for a contract lock with a separator after
+// its prefix, and the whole lock for one without (a vault compiled without
+// OP_PUSH_TX has none: no scriptCode is then signed or checked).
+func advScriptCode(lock []byte) []byte {
+	off := 1 + 32
+	if op := lock[off]; op >= 0x51 && op <= 0x60 {
+		off++
+	} else {
+		off += 1 + int(op)
+	}
+	off++ // OP_2DROP
+	if off+1 >= len(lock) || lock[off+1] != 0xab {
+		return lock
+	}
+	return lock[off+2:]
+}
+
 func advHash(pre []byte) []byte {
 	h := sha256.Sum256(pre)
 	d := sha256.Sum256(h[:])
@@ -148,7 +165,7 @@ func advRunTx(t testing.TB, f *fixture, s spend, o advOpts) (result, *transactio
 	if s.poolIdx >= 0 {
 		pi := s.poolIdx
 		pin := s.ins[pi]
-		pre := advPreimage(t, tx, pi, pin.sats, afterSeparator(pin.lock), advFlag(o.preFlag), o.preBIP143)
+		pre := advPreimage(t, tx, pi, pin.sats, advScriptCode(pin.lock), advFlag(o.preFlag), o.preBIP143)
 		sigPush := o.rawSig
 		if sigPush == nil {
 			sigTx, sigIn := tx, pin
@@ -159,7 +176,7 @@ func advRunTx(t testing.TB, f *fixture, s spend, o advOpts) (result, *transactio
 			if o.sigFlag == 0 && s.sigFlag != 0 {
 				sf = s.sigFlag
 			}
-			sig, err := s.signer.Sign(advHash(advPreimage(t, sigTx, pi, sigIn.sats, afterSeparator(sigIn.lock), sf, false)))
+			sig, err := s.signer.Sign(advHash(advPreimage(t, sigTx, pi, sigIn.sats, advScriptCode(sigIn.lock), sf, false)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -173,13 +190,16 @@ func advRunTx(t testing.TB, f *fixture, s spend, o advOpts) (result, *transactio
 		for _, l := range o.leading {
 			u = append(u, l...)
 		}
+		// _codePart: Swap and Rescind take it (they write a continuation);
+		// Close, with a fixed-width state, does not.
 		code := f.code
 		if o.codePart != nil {
 			code = o.codePart
 		}
-		if o.rawCode != nil {
+		switch {
+		case o.rawCode != nil:
 			u = append(u, o.rawCode...)
-		} else {
+		case s.method != methodClose || o.codePart != nil:
 			u = append(u, pushData(code)...)
 		}
 		u = append(u, sigPush...)
@@ -242,7 +262,7 @@ func advRunTx(t testing.TB, f *fixture, s spend, o advOpts) (result, *transactio
 		if prevouts == nil {
 			prevouts = real
 		}
-		vpre := advPreimage(t, tx, s.vaultIdx, vin.sats, afterSeparator(vin.lock), flag, false)
+		vpre := advPreimage(t, tx, s.vaultIdx, vin.sats, advScriptCode(vin.lock), flag, false)
 		if s.forgeVaultPre != nil {
 			vpre = s.forgeVaultPre(vpre)
 		}
@@ -314,7 +334,7 @@ type advArtifact struct {
 	CodeSepIndexSlots []advSlot `json:"codeSepIndexSlots"`
 	CodePartLenSlots  []advSlot `json:"codePartLenSlots"`
 
-	head     bool // the PairPool artifact JSON has a codePartLenSlots key
+	head     bool // compiled by Rúnar main (go.work), not the go.mod pin
 	template []byte
 	sa       runar.RunarArtifact
 }
@@ -325,8 +345,8 @@ var (
 	advArtErr  error
 )
 
-// advArt is the PairPool artifact as JSON. HEAD is detected from this
-// artifact only (the Vault artifact has no codePartLenSlots key on either).
+// advArt is the PairPool artifact as JSON, and which compiler made it.
+// advIsHead (the name pair_strict_test.go uses) means Rúnar main.
 func advArt(t testing.TB) *advArtifact {
 	t.Helper()
 	advArtOnce.Do(func() {
@@ -344,11 +364,22 @@ func advArt(t testing.TB) *advArtifact {
 		if advArtErr = json.Unmarshal(js, a); advArtErr != nil {
 			return
 		}
+		// Two independent signals of Rúnar main, which must agree: its
+		// artifact JSON has a rawScriptSpans key, and its state writer checks
+		// each 33-byte key's size as OP_SIZE <21> OP_NUMEQUALVERIFY (the
+		// contract's own Len == 33 compiles to OP_SIZE OP_NIP <21>
+		// OP_NUMEQUALVERIFY on both compilers, which this does not match).
 		var keys map[string]json.RawMessage
 		if advArtErr = json.Unmarshal(js, &keys); advArtErr != nil {
 			return
 		}
-		_, a.head = keys["codePartLenSlots"]
+		_, spans := keys["rawScriptSpans"]
+		writer := strings.Count(a.ASM, "OP_SIZE <21> OP_NUMEQUALVERIFY")
+		if spans != (writer > 0) {
+			advArtErr = fmt.Errorf("toolchain detection: rawScriptSpans key %v but %d writer size checks", spans, writer)
+			return
+		}
+		a.head = spans
 		if a.template, advArtErr = hex.DecodeString(a.Script); advArtErr != nil {
 			return
 		}
@@ -365,32 +396,26 @@ func advIsHead(t testing.TB) bool { return advArt(t).head }
 
 func advToolchain(t testing.TB) string {
 	if advIsHead(t) {
-		return "HEAD"
+		return "Rúnar main"
 	}
-	return "pinned"
+	return "pinned Rúnar"
 }
 
 type advWant int
 
 const (
-	advPass   advWant = iota // must pass
-	advFail                  // must fail
-	advRecord                // log only
+	advPass advWant = iota // must pass
+	advFail                // the pool input must fail
 )
 
-// advCheck asserts ok against head's or pinned's expectation and logs an
-// ADV-RECORD line either way (`go test -v ./pool/pair/ | grep ADV-RECORD`).
-func advCheck(t *testing.T, name string, r result, head, pinned advWant) {
+// advCheck asserts r and logs an ADV-RECORD line naming the compiler
+// (`go test -v ./pool/pair/ | grep ADV-RECORD`).
+func advCheck(t *testing.T, name string, r result, want advWant) {
 	t.Helper()
-	want := pinned
-	if advIsHead(t) {
-		want = head
-	}
 	t.Logf("ADV-RECORD %s | %s | pool=%v vault=%v", advToolchain(t), name, advErrS(r.pool), advErrS(r.vault))
-	switch want {
-	case advPass:
+	if want == advPass {
 		mustPass(t, r)
-	case advFail:
+	} else {
 		mustFailPool(t, r)
 	}
 }
@@ -410,20 +435,26 @@ func advErrS(err error) string {
 
 var advCfgs = [][3]int64{{30, 5, 10}, {0, 0, 0}}
 
-var (
-	advFixMu    sync.Mutex
-	advFixCache = map[[3]int64]*fixture{}
-)
+var advFixMu sync.Mutex
 
 func advFix(t testing.TB, bps [3]int64) *fixture {
 	t.Helper()
+	return advFixIDs(t, assetA, assetB, bps)
+}
+
+var advFixIDCache = map[string]*fixture{}
+
+// advFixIDs is advFix for a pair of the two given asset ids.
+func advFixIDs(t testing.TB, idA, idB []byte, bps [3]int64) *fixture {
+	t.Helper()
 	advFixMu.Lock()
 	defer advFixMu.Unlock()
-	if f, ok := advFixCache[bps]; ok {
+	k := fmt.Sprintf("%x/%x/%v", idA, idB, bps)
+	if f, ok := advFixIDCache[k]; ok {
 		return f
 	}
-	f := newFixture(t, bps[0], bps[1], bps[2])
-	advFixCache[bps] = f
+	f := newFixtureIDs(t, idA, idB, bps[0], bps[1], bps[2])
+	advFixIDCache[k] = f
 	return f
 }
 
@@ -476,25 +507,26 @@ func advCopy(s spend) spend {
 	return s
 }
 
-// State offsets (pair.state): ReserveA 0, ReserveB 8, LpPubKey 16,
-// ValidatorPubKey 49, ValidatorIdentity 82, Nonce 115, LpFeeAPkh 147,
-// LpFeeBPkh 167, Affirmation length byte 187, Affirmation 188.
+// State offsets (pair.state, 251 bytes, every field fixed-width): ReserveA 0,
+// ReserveB 8, LpPubKey 16, ValidatorPubKey 49, ValidatorIdentity 82, Nonce
+// 115, LpFeeAPkh 147, LpFeeBPkh 167, AffirmationR 187, AffirmationS 219.
 const (
-	advOffA      = 0
-	advOffB      = 8
-	advOffLp     = 16
-	advOffVal    = 49
-	advOffId     = 82
-	advOffNonce  = 115
-	advOffFeeA   = 147
-	advOffFeeB   = 167
-	advOffAffLen = 187
-	advOffAff    = 188
+	advOffA     = 0
+	advOffB     = 8
+	advOffLp    = 16
+	advOffVal   = 49
+	advOffId    = 82
+	advOffNonce = 115
+	advOffFeeA  = 147
+	advOffFeeB  = 167
+	advOffAffR  = 187
+	advOffAffS  = 219
+	advStateLen = 251
 )
 
 // advLockState is a pool output script with the given raw state.
 func (f *fixture) advLockState(a int64, state []byte) []byte {
-	s := append(append([]byte{}, tokenPrefix(assetA, a)...), f.code...)
+	s := append(append([]byte{}, tokenPrefix(f.idA, a)...), f.code...)
 	s = append(s, 0x6a)
 	return append(s, state...)
 }
@@ -534,9 +566,9 @@ func advBuildSwap(f *fixture, p pair, a advSwap) (spend, swapResult) {
 		tcPkh = a.tcPkh
 	}
 	r := f.model(p, a.amountIn, a.aIn, next)
-	inAsset, outAsset, lpPkh := assetA, assetB, lpFeeAPkh
+	inAsset, outAsset, lpPkh := f.idA, f.idB, lpFeeAPkh
 	if !a.aIn {
-		inAsset, outAsset, lpPkh = assetB, assetA, lpFeeBPkh
+		inAsset, outAsset, lpPkh = f.idB, f.idA, lpFeeBPkh
 	}
 	nextBytes := next.PubKey().Compressed()
 	poolOut := f.poolLock(r.after)
@@ -1001,6 +1033,19 @@ func TestAdv_VaultWithoutItsPool(t *testing.T) {
 			mustFailVault(t, advH(t, f, spend{ins: c.ins, outs: steal, poolIdx: -1, vaultIdx: c.vi}))
 		})
 	}
+	t.Run("without its pool, a forged preimage naming its pool's outpoint in hashPrevouts", func(t *testing.T) {
+		// hashPrevouts replaced by hash256 of the prevouts an honest spend
+		// would show; the outpoint field already the vault's own. Only
+		// OP_PUSH_TX (CheckPreimage) ties the preimage to this transaction.
+		fake := append(outpoint(pool), outpoint(vault)...)
+		s := spend{ins: []in{fund, vault}, outs: steal, poolIdx: -1, vaultIdx: 1, vaultPrevouts: fake}
+		s.forgeVaultPre = func(real []byte) []byte {
+			c := append([]byte{}, real...)
+			copy(c[4:36], advHash(fake))
+			return c
+		}
+		mustFailVault(t, advH(t, f, s))
+	})
 	t.Run("told the honest prevouts in a transaction without the pool", func(t *testing.T) {
 		s := spend{ins: []in{fund, vault}, outs: steal, poolIdx: -1, vaultIdx: 1}
 		s.vaultPrevouts = append(outpoint(pool), outpoint(vault)...)
@@ -1161,6 +1206,490 @@ func TestTrustModel_VaultCodeHashIsWhateverWasDeployed(t *testing.T) {
 	}
 }
 
+// --- addresses, token change, deploy checks ---
+
+// Every address argument must be 20 bytes, checked whether or not an output
+// uses it. Lengths 0 to 40, each with the outputs the contract would write
+// for it and with the honest outputs; only 20 passes.
+func TestAdv_AddressLengths(t *testing.T) {
+	for _, bps := range advCfgs {
+		f := advFix(t, bps)
+		p := fresh()
+		for _, aIn := range []bool{true, false} {
+			if bps[0] == 0 && !aIn {
+				continue // the no-fee pair in one direction is enough
+			}
+			inAsset, outAsset := f.idA, f.idB
+			if !aIn {
+				inAsset, outAsset = f.idB, f.idA
+			}
+			base, r := advBuildSwap(f, p, advSwap{amountIn: 40_000, aIn: aIn})
+			withTc, _ := advBuildSwap(f, p, advSwap{amountIn: 40_000, aIn: aIn, tc: 777})
+			comIdx := -1
+			if r.com > 0 {
+				comIdx = len(base.outs) - 1
+			}
+			name := fmt.Sprintf("bps %v %s", bps, advDir(aIn))
+			accepted := map[string][]int{}
+			for n := 0; n <= 40; n++ {
+				h := bytes.Repeat([]byte{0x9c}, n)
+				type v struct {
+					name string
+					s    spend
+				}
+				var vs []v
+				c := advCopy(base)
+				c.args[3] = pushData(h)
+				c.outs[2].script = append(tokenPrefix(outAsset, r.out), p2pkh(h)...)
+				vs = append(vs, v{"userPkh, its output built from it", c})
+				c = advCopy(base)
+				c.args[4] = pushData(h)
+				if comIdx >= 0 {
+					c.outs[comIdx].script = append(tokenPrefix(inAsset, r.com), p2pkh(h)...)
+					vs = append(vs, v{"commissionPkh, its output built from it", c})
+				} else {
+					vs = append(vs, v{"commissionPkh, no commission output", c})
+				}
+				c = advCopy(withTc)
+				c.args[5] = pushData(h)
+				c.outs[len(c.outs)-1].script = append(tokenPrefix(inAsset, 777), p2pkh(h)...)
+				vs = append(vs, v{"tokenChangePkh, its output built from it", c})
+				c = advCopy(base)
+				c.args[5] = pushData(h)
+				vs = append(vs, v{"tokenChangePkh, no token change", c})
+				if n != 20 {
+					for _, i := range []int{3, 4, 5} {
+						c = advCopy(base)
+						c.args[i] = pushData(h)
+						vs = append(vs, v{fmt.Sprintf("argument %d, the honest outputs", i), c})
+					}
+				}
+				for _, x := range vs {
+					x.s.vaultIdx = -1
+					if advRun(t, f, x.s, advOpts{}).pool == nil {
+						accepted[x.name] = append(accepted[x.name], n)
+					}
+				}
+			}
+			for k, ns := range accepted {
+				if len(ns) != 1 || ns[0] != 20 {
+					t.Errorf("%s: %s accepted at lengths %v, want only 20", name, k, ns)
+				}
+			}
+			for _, k := range []string{"userPkh, its output built from it", "tokenChangePkh, its output built from it", "tokenChangePkh, no token change"} {
+				at20 := false
+				for _, n := range accepted[k] {
+					at20 = at20 || n == 20
+				}
+				if !at20 {
+					t.Errorf("%s: %s not accepted at 20 bytes", name, k)
+				}
+			}
+			t.Logf("%s: accepted lengths %v", name, accepted)
+			for i, an := range []string{"userPkh", "commissionPkh", "tokenChangePkh"} {
+				c := advCopy(base)
+				c.args[3+i] = append([]byte{0x4c, 20}, [][]byte{userPkh, commissionPkh, changePkh}[i]...)
+				r, tx := advRunTx(t, f, c, advOpts{})
+				_, btx := advRunTx(t, f, base, advOpts{})
+				mustPass(t, r)
+				if len(tx.Outputs) != len(btx.Outputs) {
+					t.Fatalf("%s as PUSHDATA1 changed the output count", an)
+				}
+				for j := range tx.Outputs {
+					if !bytes.Equal(tx.Outputs[j].Bytes(), btx.Outputs[j].Bytes()) {
+						t.Fatalf("%s as PUSHDATA1 moved output %d", an, j)
+					}
+				}
+			}
+		}
+	}
+}
+
+// advNumPad encodes v as a script number of exactly n bytes (n >= its
+// minimal length), the sign on the last byte; nil if it does not fit.
+func advNumPad(v *big.Int, n int) []byte {
+	m := propScriptNum(new(big.Int).Abs(v))
+	if len(m) > n {
+		return nil
+	}
+	b := append(append([]byte{}, m...), make([]byte, n-len(m))...)
+	if v.Sign() < 0 {
+		b[n-1] |= 0x80
+	}
+	return b
+}
+
+// tokenChange: 0 <= tokenChange <= 2^64-1 (BRC-162's largest amount),
+// whatever its encoding, and the
+// change output always carries the minimal encoding of its value (the
+// contract writes Bin2Num(Num2Bin(tokenChange, 9))). Every value in minimal
+// and padded (9, 10, 16 bytes) encodings, with the output the value's
+// minimal push and, for a non-minimal argument, the output the bytes as given.
+func TestAdv_TokenChangeEncoding(t *testing.T) {
+	f := advFix(t, [3]int64{30, 5, 10})
+	p := fresh()
+	pow := func(e uint) *big.Int { return new(big.Int).Lsh(big.NewInt(1), e) }
+	values := []struct {
+		name string
+		v    *big.Int
+	}{
+		{"0", big.NewInt(0)}, {"5", big.NewInt(5)}, {"17", big.NewInt(17)}, {"128", big.NewInt(128)},
+		{"2^63-1", new(big.Int).Sub(pow(63), big.NewInt(1))}, {"2^63", pow(63)}, {"2^63+1", new(big.Int).Add(pow(63), big.NewInt(1))},
+		{"2^64-1", new(big.Int).Sub(pow(64), big.NewInt(1))}, {"2^64", pow(64)}, {"2^64+1", new(big.Int).Add(pow(64), big.NewInt(1))},
+		{"2^71-1 (the largest 9-byte number)", new(big.Int).Sub(pow(71), big.NewInt(1))},
+		{"2^100", pow(100)}, {"-1", big.NewInt(-1)}, {"-2^63", new(big.Int).Neg(pow(63))},
+	}
+	max := new(big.Int).Sub(pow(64), big.NewInt(1))
+	for _, aIn := range []bool{true, false} {
+		inAsset := f.idA
+		if !aIn {
+			inAsset = f.idB
+		}
+		base, _ := advBuildSwap(f, p, advSwap{amountIn: 40_000, aIn: aIn})
+		for _, val := range values {
+			encs := []struct {
+				name string
+				data []byte
+			}{{"minimal", propScriptNum(val.v)}}
+			for _, n := range []int{9, 10, 16} {
+				if b := advNumPad(val.v, n); b != nil && !bytes.Equal(b, propScriptNum(val.v)) {
+					encs = append(encs, struct {
+						name string
+						data []byte
+					}{fmt.Sprintf("padded to %d bytes", n), b})
+				}
+			}
+			ok := val.v.Sign() >= 0 && val.v.Cmp(max) <= 0
+			for _, e := range encs {
+				val, e := val, e
+				t.Run(fmt.Sprintf("%s: %s %s", advDir(aIn), val.name, e.name), func(t *testing.T) {
+					push := pushData(e.data)
+					c := advCopy(base)
+					c.args[6] = push
+					if val.v.Sign() > 0 {
+						c.outs = append(c.outs, out{1, propTokenOut(inAsset, val.v, changePkh)})
+					}
+					r := advH(t, f, c)
+					t.Logf("output the minimal push: pool %v", advErrS(r.pool))
+					if ok {
+						mustPass(t, r)
+					} else {
+						mustFailPool(t, r)
+					}
+					if val.v.Sign() > 0 && e.name != "minimal" {
+						g := advCopy(base)
+						g.args[6] = push
+						pre := append(append([]byte{0x20}, inAsset...), push...)
+						g.outs = append(g.outs, out{1, append(append(pre, 0x6d), p2pkh(changePkh)...)})
+						rg := advH(t, f, g)
+						t.Logf("output the push as given: pool %v", advErrS(rg.pool))
+						mustFailPool(t, rg)
+					}
+					if val.v.Sign() < 0 {
+						g := advCopy(base)
+						g.args[6] = push
+						g.outs = append(g.outs, out{1, propTokenOut(inAsset, new(big.Int).Abs(val.v), changePkh)})
+						mustFailPool(t, advH(t, f, g))
+					}
+				})
+			}
+		}
+		for _, nz := range [][]byte{{0x80}, {0x00, 0x80}, append(make([]byte, 8), 0x80), append(make([]byte, 15), 0x80)} {
+			nz := nz
+			t.Run(fmt.Sprintf("%s: negative zero %x: no change output", advDir(aIn), nz), func(t *testing.T) {
+				c := advCopy(base)
+				c.args[6] = pushData(nz)
+				mustPass(t, advH(t, f, c))
+				g := advCopy(c)
+				g.outs = append(g.outs, out{1, tokenP2pkh(inAsset, 1, changePkh)})
+				mustFailPool(t, advH(t, f, g))
+			})
+		}
+	}
+}
+
+// advShaped is the Swap the script's own arithmetic gives for any fee rates
+// (each fee (amountIn*bps + 9999) / 10000, truncated toward zero as OP_DIV
+// does; a fee output only where the fee is positive), on a pair of f's ids.
+// ok is false when no net enters or nothing is paid out.
+func advShaped(f *fixture, p pair, amountIn *big.Int, aIn bool, tc int64) (spend, bool) {
+	fee := func(bps int64) *big.Int {
+		x := new(big.Int).Mul(amountIn, big.NewInt(bps))
+		x.Add(x, big.NewInt(9999))
+		return x.Quo(x, big.NewInt(10000))
+	}
+	fees := []*big.Int{fee(f.bps[0]), fee(f.bps[1]), fee(f.bps[2])}
+	net := new(big.Int).Sub(amountIn, fees[0])
+	net.Sub(net, fees[1]).Sub(net, fees[2])
+	if net.Sign() <= 0 {
+		return spend{}, false
+	}
+	rin, rout := big.NewInt(p.a), big.NewInt(p.b)
+	inAsset, outAsset, lpPkh := f.idA, f.idB, lpFeeAPkh
+	if !aIn {
+		rin, rout = rout, rin
+		inAsset, outAsset, lpPkh = f.idB, f.idA, lpFeeBPkh
+	}
+	paid := new(big.Int).Quo(new(big.Int).Mul(net, rout), new(big.Int).Add(rin, net))
+	newIn := new(big.Int).Add(rin, net)
+	if paid.Sign() <= 0 || newIn.Cmp(propMax63) > 0 {
+		return spend{}, false
+	}
+	after := p
+	after.validator = advNext(p.validator)
+	after.a, after.b = newIn.Int64(), p.b-paid.Int64()
+	if !aIn {
+		after.a, after.b = p.a-paid.Int64(), newIn.Int64()
+	}
+	outs := []out{{p.sats, f.poolLock(after)}, {1, f.vaultLock(after)}, {1, propTokenOut(outAsset, paid, userPkh)}}
+	for i, h := range [][]byte{lpPkh, pkh(p.validator), commissionPkh} {
+		if fees[i].Sign() > 0 {
+			outs = append(outs, out{1, propTokenOut(inAsset, fees[i], h)})
+		}
+	}
+	if tc > 0 {
+		outs = append(outs, out{1, tokenP2pkh(inAsset, tc, changePkh)})
+	}
+	return spend{
+		ins: f.ins(p), outs: outs, poolIdx: 0, vaultIdx: 1, method: methodSwap, signer: p.validator,
+		args: [][]byte{
+			pushData(after.validator.PubKey().Compressed()), propPushBig(amountIn), pushBool(aIn),
+			pushData(userPkh), pushData(commissionPkh), pushData(changePkh), pushNum(tc),
+		},
+	}, true
+}
+
+// A pool deployed wrong for swapping: one token on both sides, or a negative
+// fee rate. Swap is refused whatever its arguments, with the outputs the
+// contract's arithmetic would write; Rescind and Close still work, and
+// Rescind then Close.
+func TestAdv_UnswappableDeploys(t *testing.T) {
+	type dep struct {
+		name     string
+		idA, idB []byte
+		bps      [3]int64
+	}
+	deps := []dep{
+		{"one token on both sides (A, A)", assetA, assetA, [3]int64{30, 5, 10}},
+		{"one token on both sides (B, B), no fees", assetB, assetB, [3]int64{0, 0, 0}},
+		{"LP fee -1", assetA, assetB, [3]int64{-1, 0, 0}},
+		{"validator fee -1", assetA, assetB, [3]int64{0, -1, 0}},
+		{"commission -1", assetA, assetB, [3]int64{0, 0, -1}},
+		{"LP fee -10000", assetA, assetB, [3]int64{-10_000, 0, 0}},
+		{"LP fee -10^12", assetA, assetB, [3]int64{-1_000_000_000_000, 0, 0}},
+		{"commission -2^40", assetA, assetB, [3]int64{0, 0, -(1 << 40)}},
+		{"6000, 6000, -3000 (a 90% total)", assetA, assetB, [3]int64{6000, 6000, -3000}},
+		{"30, 5, -10", assetA, assetB, [3]int64{30, 5, -10}},
+		{"-30, -5, -10", assetA, assetB, [3]int64{-30, -5, -10}},
+	}
+	for _, d := range deps {
+		d := d
+		t.Run(d.name, func(t *testing.T) {
+			f := advFixIDs(t, d.idA, d.idB, d.bps)
+			p := fresh()
+			tried := 0
+			for _, aIn := range []bool{true, false} {
+				for _, in := range []int64{1, 3, 40_000, 1_000_000_000} {
+					for _, tc := range []int64{0, 777} {
+						s, ok := advShaped(f, p, big.NewInt(in), aIn, tc)
+						if !ok {
+							continue
+						}
+						tried++
+						variants := map[string]spend{"as shaped": s}
+						if in != 40_000 {
+							if r := advH(t, f, s); r.pool == nil {
+								t.Errorf("%s in %d tc %d: Swap ACCEPTED", advDir(aIn), in, tc)
+							}
+							continue
+						}
+						c := advCopy(s)
+						c.change = &out{900, changePkh}
+						c.outs = append(c.outs, out{900, p2pkh(changePkh)})
+						variants["with sats change"] = c
+						c = advCopy(s)
+						c.args[3] = pushData(pkh(key(0x45)))
+						c.outs[2].script = append(c.outs[2].script[:len(c.outs[2].script)-25], p2pkh(pkh(key(0x45)))...)
+						variants["another payout address"] = c
+						for vn, v := range variants {
+							if r := advH(t, f, v); r.pool == nil {
+								t.Errorf("%s in %d tc %d (%s): Swap ACCEPTED", advDir(aIn), in, tc, vn)
+							}
+						}
+					}
+				}
+			}
+			if tried == 0 {
+				t.Fatal("no shaped Swap: the case does not reach the check")
+			}
+			rs, after := f.rescind(p)
+			mustPass(t, advH(t, f, rs))
+			mustPass(t, advH(t, f, f.close(p)))
+			mustPass(t, advH(t, f, f.close(after)))
+			t.Logf("%d shaped Swaps refused (and variants); Rescind, Close, Rescind then Close pass", tried)
+		})
+	}
+	t.Run("control: the same shapes on a well-deployed pair pass", func(t *testing.T) {
+		f := advFix(t, [3]int64{30, 5, 10})
+		for _, aIn := range []bool{true, false} {
+			s, ok := advShaped(f, fresh(), big.NewInt(40_000), aIn, 777)
+			if !ok {
+				t.Fatal("not shaped")
+			}
+			mustPass(t, advH(t, f, s))
+		}
+	})
+}
+
+// Fee rates summing to 10000 bps or more, none negative: the contract has no
+// sum check, relying on a positive amountIn leaving no net (each fee rounds
+// up, so their sum is at least amountIn). Searched over amounts 1..3000,
+// powers of two to 2^62 and their neighbours, both directions: no amount may
+// leave a positive net. A sample runs through the interpreter (refused), and a
+// negative amountIn, which makes the truncated fees negative and the net
+// positive, is refused by amountIn > 0.
+func TestAdv_FeeRatesSummingToTheWholeAmount(t *testing.T) {
+	for _, bps := range [][3]int64{{5000, 5000, 0}, {10_000, 0, 0}, {3334, 3333, 3333}, {9999, 1, 0}, {2500, 2500, 5000}, {10_000, 10_000, 10_000}, {1 << 40, 0, 0}} {
+		bps := bps
+		t.Run(fmt.Sprintf("bps %v", bps), func(t *testing.T) {
+			f := advFix(t, bps)
+			p := fresh()
+			var amounts []*big.Int
+			for i := int64(1); i <= 3000; i++ {
+				amounts = append(amounts, big.NewInt(i))
+			}
+			for e := uint(12); e <= 62; e++ {
+				x := new(big.Int).Lsh(big.NewInt(1), e)
+				amounts = append(amounts, new(big.Int).Sub(x, big.NewInt(1)), x, new(big.Int).Add(x, big.NewInt(1)))
+			}
+			for _, in := range amounts {
+				for _, aIn := range []bool{true, false} {
+					if _, ok := advShaped(f, p, in, aIn, 0); ok {
+						t.Errorf("amountIn %v %s: a positive net and a payout under rates summing to %d", in, advDir(aIn), bps[0]+bps[1]+bps[2])
+					}
+				}
+			}
+			for _, in := range []int64{1, 2, 3, 10_000, 40_000, 1 << 40} {
+				s, _ := f.swap(p, in, true)
+				mustFailPool(t, advH(t, f, s))
+			}
+			neg := big.NewInt(-10_000)
+			if s, ok := advShaped(f, p, neg, true, 0); ok {
+				r := advH(t, f, s)
+				t.Logf("amountIn -10000: truncated fees leave a positive net; pool %v", advErrS(r.pool))
+				mustFailPool(t, r)
+			}
+		})
+	}
+}
+
+// TRUST MODEL. Rúnar does not check the length of _changePKH: the change
+// output is serialised as <amount> 19 76a914 <_changePKH> 88ac, the length
+// byte fixed at 25, so a _changePKH of <20-byte hash> 88ac <8-byte value>
+// <length byte> <a script minus its last two bytes> (the script ending
+// 88ac) makes the serialised outputs read as the change output and then one
+// more output. A Swap and a Rescind with that extra output after the change
+// are accepted by both inputs. The contract cannot reach the argument; by
+// the compiler's design today the validator, before signing, must refuse a
+// _changePKH that is not 20 bytes and any output past the contract's.
+func TestTrustModel_ChangePkhCarriesAnExtraOutput(t *testing.T) {
+	f := advFix(t, [3]int64{30, 5, 10})
+	p := fresh()
+	extra := p2pkh(pkh(key(0x5c)))
+	const extraSats, changeSats = 5_000, 4_321
+	ext := append(append([]byte{}, changePkh...), 0x88, 0xac)
+	for i := 0; i < 8; i++ {
+		ext = append(ext, byte(uint64(extraSats)>>(8*i)))
+	}
+	ext = append(ext, byte(len(extra)))
+	ext = append(ext, extra[:len(extra)-2]...)
+	sw, _ := advBuildSwap(f, p, advSwap{amountIn: 40_000, aIn: true})
+	rs, _ := f.rescind(p)
+	for _, m := range []struct {
+		name string
+		s    spend
+	}{{"Swap", sw}, {"Rescind", rs}} {
+		m := m
+		t.Run(m.name+": an extra output smuggled through _changePKH", func(t *testing.T) {
+			c := advCopy(m.s)
+			c.change = &out{changeSats, ext}
+			c.outs = append(c.outs, out{changeSats, p2pkh(changePkh)}, out{extraSats, extra})
+			mustPass(t, advH(t, f, c))
+			t.Logf("%s accepted with an output of %d sats to %x after the change", m.name, extraSats, extra)
+			// the same transaction without the extra output is refused
+			d := advCopy(c)
+			d.outs = d.outs[:len(d.outs)-1]
+			mustFailPool(t, advH(t, f, d))
+		})
+		t.Run(m.name+": a 19-byte _changePKH", func(t *testing.T) {
+			c := advCopy(m.s)
+			c.change = &out{changeSats, changePkh[:19]}
+			c.outs = append(c.outs, out{changeSats, p2pkh(changePkh[:19])})
+			mustFailPool(t, advH(t, f, c))
+		})
+	}
+}
+
+// No fee output can exceed BRC-162's largest amount, 2^64-1: amountIn is at
+// most 2^64-1, and a fee is at most ceil(amountIn * bps / 10000) with bps
+// below 10000 for any Swap that leaves a net. At 9999 bps, amountIn 2^64 and
+// the smallest amountIn whose fee would be 2^64 or more are refused, with the
+// outputs the script's arithmetic gives; amountIn 2^64-1 at
+// 9999 bps passes, its fee written as the minimal push of
+// ceil((2^64-1) * 9999 / 10000), under 2^64.
+func TestAdv_FeeCannotExceedTheTokenMaximum(t *testing.T) {
+	max := propPow2m1(64)
+	for which, name := range []string{"LP fee", "validator fee", "commission"} {
+		var bps [3]int64
+		bps[which] = 9999
+		f := advFix(t, bps)
+		p := propPairOf(1_000_000_000_000_000, 1_000_000_000_000_000)
+		for _, aIn := range []bool{true, false} {
+			// the bound itself, and the smallest amountIn whose fee would pass 2^64-1
+			over := new(big.Int).Mul(propPow2(64), big.NewInt(10000))
+			over.Add(over, big.NewInt(9998)).Quo(over, big.NewInt(9999))
+			for _, c := range []struct {
+				name string
+				in   *big.Int
+				big  bool // its fee is above 2^64-1
+			}{{"amountIn 2^64", propPow2(64), false}, {"the smallest amountIn with a fee of 2^64 or more", over, true}} {
+				c := c
+				t.Run(fmt.Sprintf("%s, %s: %s refused", name, advDir(aIn), c.name), func(t *testing.T) {
+					s, v := propSpend(f, p, c.in, aIn, nil, nil)
+					if v.ok || v.net.Sign() <= 0 || v.out.Sign() <= 0 || v.newA.Cmp(propMax63) > 0 || v.newB.Cmp(propMax63) > 0 {
+						t.Fatalf("not an amountIn-only refusal: ok %v net %v (%s)", v.ok, v.net, v.why)
+					}
+					fee := []*big.Int{v.lp, v.val, v.com}[which]
+					if (fee.Cmp(max) > 0) != c.big {
+						t.Fatalf("fee %v above 2^64-1: %v, want %v", fee, fee.Cmp(max) > 0, c.big)
+					}
+					mustFailPool(t, advH(t, f, s))
+				})
+			}
+			t.Run(fmt.Sprintf("%s, %s: amountIn 2^64-1, the largest fee", name, advDir(aIn)), func(t *testing.T) {
+				s, v := propSpend(f, p, max, aIn, nil, nil)
+				if !v.ok {
+					t.Fatal(v.why)
+				}
+				fee := []*big.Int{v.lp, v.val, v.com}[which]
+				want := propCeilFee(max, 9999)
+				if fee.Cmp(want) != 0 || fee.Cmp(max) > 0 {
+					t.Fatalf("fee %v, want %v", fee, want)
+				}
+				in := f.idA
+				if !aIn {
+					in = f.idB
+				}
+				if !bytes.HasPrefix(s.outs[3].script, propTokenPrefix(in, fee)) {
+					t.Fatal("fee output is not the fee's minimal push")
+				}
+				mustPass(t, advH(t, f, s))
+				t.Logf("largest %s: %v (%x)", name, fee, propScriptNum(fee))
+			})
+		}
+	}
+}
+
 // --- stranding ---
 
 // No accepted spend of a pool leaves its vault behind. Every advRun in both
@@ -1250,7 +1779,7 @@ func advCodeFor(t testing.TB, a, b, vaultHash []byte, bps [3]int64) []byte {
 	c := runar.NewRunarContract(&sa, []interface{}{
 		p.a, p.b,
 		h(p.lp.PubKey().Compressed()), h(p.validator.PubKey().Compressed()), h(validatorIdentity.PubKey().Compressed()),
-		h(nonce), h(lpFeeAPkh), h(lpFeeBPkh), h(affirmation),
+		h(nonce), h(lpFeeAPkh), h(lpFeeBPkh), h(affirmationR), h(affirmationS),
 		h(a), h(b), h(vaultHash), bps[0], bps[1], bps[2],
 	})
 	full, _ := hex.DecodeString(c.GetLockingScript())
@@ -1387,8 +1916,8 @@ func TestAdv_SwapOutputSet(t *testing.T) {
 		}{
 			{"ReserveA", advOffA, 8}, {"ReserveB", advOffB, 8}, {"LpPubKey", advOffLp, 33},
 			{"ValidatorPubKey", advOffVal, 33}, {"ValidatorIdentity", advOffId, 33}, {"Nonce", advOffNonce, 32},
-			{"LpFeeAPkh", advOffFeeA, 20}, {"LpFeeBPkh", advOffFeeB, 20}, {"Affirmation length", advOffAffLen, 1},
-			{"Affirmation", advOffAff, len(affirmation)},
+			{"LpFeeAPkh", advOffFeeA, 20}, {"LpFeeBPkh", advOffFeeB, 20},
+			{"AffirmationR", advOffAffR, 32}, {"AffirmationS", advOffAffS, 32},
 		}
 		for _, fd := range fields {
 			for _, at := range []int{0, fd.len - 1} {
@@ -1467,20 +1996,29 @@ func TestTrustModel_ValidatorDrainsWithFakeTokenInput(t *testing.T) {
 	}
 }
 
-// TRUST MODEL. nextValidatorPubKey is any 33 bytes: a validator naming bytes
-// no one holds ends Swap and Rescind for good, and the LP still closes.
-// Off-chain check: the lookup and the LP watch for a rotation to a key the
-// validator cannot sign with (the pool is then only closable).
+// TRUST MODEL. Swap checks only the next key's type byte (02 or 03) and,
+// writing the state, its 33 bytes: a validator naming 02/03 and 32 bytes no
+// one holds (not a point on the curve, or a point whose key is unknown) ends
+// Swap and Rescind for good, and the LP still closes. Off-chain check: the
+// lookup and the LP watch for a rotation to a key the validator cannot sign
+// with (the pool is then only closable).
 func TestTrustModel_ValidatorNamesUnusableNextKey(t *testing.T) {
 	f := advFix(t, [3]int64{30, 5, 10})
 	p := fresh()
+	nobody := advSha([]byte("a point no one holds the key to"))
 	for _, nk := range []struct {
 		name string
 		b    []byte
 	}{
-		{"33 zero bytes", make([]byte, 33)},
 		{"02 || ff*32 (x not on the curve)", append([]byte{0x02}, bytes.Repeat([]byte{0xff}, 32)...)},
-		{"07 || a real x (bad prefix)", append([]byte{0x07}, key(50).PubKey().Compressed()[1:]...)},
+		{"03 || ff*32 (x not on the curve)", append([]byte{0x03}, bytes.Repeat([]byte{0xff}, 32)...)},
+		{"02 || 32 zero bytes", append([]byte{0x02}, make([]byte, 32)...)},
+		{"02 || a hash as x", append([]byte{0x02}, nobody...)},
+		{"a real key with its parity byte flipped", func() []byte {
+			b := key(50).PubKey().Compressed()
+			b[0] ^= 0x01
+			return b
+		}()},
 	} {
 		nk := nk
 		t.Run(nk.name, func(t *testing.T) {
@@ -1500,6 +2038,86 @@ func TestTrustModel_ValidatorNamesUnusableNextKey(t *testing.T) {
 			mustPass(t, advH(t, f, c))
 		})
 	}
+}
+
+// The next key's shape: only a first byte of 02 or 03 passes, and only at
+// 33 bytes (the contract's own Len == 33, on both compilers). Each refused
+// case carries the continuation the contract would write for that key, so
+// the refusal is the check's and not the outputs check's.
+func TestAdv_NextValidatorKeyShape(t *testing.T) {
+	f := advFix(t, [3]int64{30, 5, 10})
+	p := fresh()
+	body := bytes.Repeat([]byte{0x5a}, 32)
+	t.Run("every first byte 00..ff, 32 bytes after it", func(t *testing.T) {
+		passed := []byte{}
+		for b := 0; b < 256; b++ {
+			k := append([]byte{byte(b)}, body...)
+			s, _ := advBuildSwap(f, p, advSwap{amountIn: 40_000, aIn: b%2 == 0, nextRaw: k})
+			r := advH(t, f, s)
+			if r.pool == nil {
+				passed = append(passed, byte(b))
+			}
+			if want := b == 2 || b == 3; want != (r.pool == nil) {
+				t.Errorf("first byte %02x: accepted=%v (%v)", b, r.pool == nil, r.pool)
+			}
+		}
+		t.Logf("accepted first bytes: %x", passed)
+	})
+	real := advNext(p.validator).PubKey().Compressed()
+	for _, first := range []byte{0x02, 0x03} {
+		x := real[1:]
+		for _, c := range []struct {
+			name string
+			k    []byte
+		}{
+			{"a valid point's x", append([]byte{first}, x...)},
+			{"x not on the curve (ff*32)", append([]byte{first}, bytes.Repeat([]byte{0xff}, 32)...)},
+			{"all-zero body", append([]byte{first}, make([]byte, 32)...)},
+		} {
+			c := c
+			t.Run(fmt.Sprintf("%02x, %s: accepted (33 bytes, the type byte right)", first, c.name), func(t *testing.T) {
+				s, _ := advBuildSwap(f, p, advSwap{amountIn: 40_000, aIn: true, nextRaw: c.k})
+				mustPass(t, advH(t, f, s))
+			})
+		}
+	}
+	lock := f.poolLock(p)
+	body0 := lock[len(tokenPrefix(f.idA, p.a)):]
+	// Other widths with the type byte right: refused, with the continuation
+	// the compiler's poolScript writes for a key of w bytes (the spent
+	// script's first len(code)+1+33-w bytes, then the new state). A
+	// continuation of code || 6a || state would be refused by the outputs
+	// check alone, the width check aside, so it is not tried.
+	for _, w := range []int{1, 2, 32, 34, 64, 65} {
+		w := w
+		t.Run(fmt.Sprintf("%d bytes starting 02", w), func(t *testing.T) {
+			k := append([]byte{0x02}, bytes.Repeat([]byte{0x5a}, w-1)...)
+			s, r := advBuildSwap(f, p, advSwap{amountIn: 40_000, aIn: true, nextRaw: k})
+			c := advCopy(s)
+			c.outs[0].script = append(append(tokenPrefix(f.idA, r.after.a), body0[:len(f.code)+1+33-w]...), advStateVal(r.after, k)...)
+			advCheck(t, fmt.Sprintf("next key of %d bytes starting 02, continuation as poolScript builds it", w), advH(t, f, c), advFail)
+		})
+	}
+	t.Run("an empty key", func(t *testing.T) {
+		s, r := advBuildSwap(f, p, advSwap{amountIn: 40_000, aIn: true, nextRaw: []byte{}})
+		mustFailPool(t, advH(t, f, s))
+		c := advCopy(s)
+		c.outs[0].script = append(append(tokenPrefix(f.idA, r.after.a), body0[:len(f.code)+1+33]...), advStateVal(r.after, nil)...)
+		mustFailPool(t, advH(t, f, c))
+	})
+	t.Run("an uncompressed key (04 first)", func(t *testing.T) {
+		s, _ := advBuildSwap(f, p, advSwap{amountIn: 40_000, aIn: true, nextRaw: advNext(p.validator).PubKey().Uncompressed()})
+		mustFailPool(t, advH(t, f, s))
+	})
+	t.Run("33 zero bytes (the rescinded key)", func(t *testing.T) {
+		s, _ := advBuildSwap(f, p, advSwap{amountIn: 40_000, aIn: true, nextRaw: make([]byte, 33)})
+		mustFailPool(t, advH(t, f, s))
+	})
+	t.Run("the key as a PUSHDATA1 push (same bytes)", func(t *testing.T) {
+		s, _ := advBuildSwap(f, p, advSwap{amountIn: 40_000, aIn: true})
+		s.args[0] = append([]byte{0x4c, 33}, real...)
+		mustPass(t, advH(t, f, s))
+	})
 }
 
 // TRUST MODEL. The validator rescinds whenever it likes; the LP closes after.
@@ -1689,7 +2307,7 @@ func TestAdv_LeadingPushesAndLayouts(t *testing.T) {
 			mn := advMethodNames[method]
 			base := advValid(f, p, method, aIn)
 			tx := advTx(base, advOpts{})
-			dig := advHash(advPreimage(t, tx, 0, base.ins[0].sats, afterSeparator(base.ins[0].lock), sighash.AllForkID, false))
+			dig := advHash(advPreimage(t, tx, 0, base.ins[0].sats, advScriptCode(base.ins[0].lock), sighash.AllForkID, false))
 			sigOf := func(k *ec.PrivateKey) []byte {
 				s, _ := k.Sign(dig)
 				return pushData(append(s.Serialize(), 0x41))
@@ -1773,6 +2391,11 @@ func TestAdv_UnlockingMalleability(t *testing.T) {
 			{"userPkh changed", false, arg(3, other20)},
 			{"commissionPkh changed", noCom, arg(4, other20)},
 			{"tokenChangePkh changed (tokenChange 0)", true, arg(5, other20)},
+			{"commissionPkh of 19 bytes", false, arg(4, pushData(bytes.Repeat([]byte{0xcd}, 19)))},
+			{"commissionPkh of 21 bytes", false, arg(4, pushData(bytes.Repeat([]byte{0xcd}, 21)))},
+			{"tokenChangePkh of 19 bytes (tokenChange 0)", false, arg(5, pushData(bytes.Repeat([]byte{0xcd}, 19)))},
+			{"tokenChangePkh of 21 bytes (tokenChange 0)", false, arg(5, pushData(bytes.Repeat([]byte{0xcd}, 21)))},
+			{"userPkh as PUSHDATA1 (same bytes)", true, arg(3, append([]byte{0x4c, 20}, userPkh...))},
 			{"tokenChange 0 -> 1", false, arg(6, pushNum(1))},
 			{"tokenChange 0 as 01 00", true, arg(6, []byte{0x01, 0x00})},
 			{"tokenChange 0 as negative zero", true, arg(6, []byte{0x01, 0x80})},
@@ -1899,26 +2522,55 @@ func TestAdv_CloseAlwaysWorks(t *testing.T) {
 	}
 }
 
-// --- Rúnar main (HEAD) vs the Rúnar pinned in go.mod ---
+// --- the compiled shape, the code-part witness, the state's shape ---
 //
-// HEAD is Rúnar v1 main, the compiler the contract requires (go.work points
-// at it); the pinned compiler is the one go.mod names (GOWORK=off). Every
-// test here passes on both: where they differ the test asserts HEAD's
-// behaviour and records the pinned one on an ADV-RECORD line
-// (`go test -v -run TestAdvHead ./pool/pair/ | grep ADV-RECORD`).
+// Every test here runs on both compilers: Rúnar main (go.work) and the Rúnar
+// go.mod pins (GOWORK=off), with the same expectation on both;
+// `go test -v ./pool/pair/ | grep ADV-RECORD` lists the outcomes by compiler.
+//
+// How Swap and Rescind authenticate the _codePart witness (Rúnar's
+// emitCodePartAuthentication, compilers/go/codegen/stack.go), on both
+// compilers: after OP_PUSH_TX has proven the preimage, its scriptCode is
+// lockingScript[2:] = codePart[2:] || 0x6a || state. The script splits
+// scriptCode at SIZE(codePart)-2 and requires (clause 8a) the remainder to be
+// exactly 1 + 251 bytes, the separator and this contract's fixed-width state;
+// then (8b) its first byte 0x6a; then 0x61ab || the claimed tail == codePart
+// byte for byte. With the state's length a compile-time constant, 8a pins the
+// split point, so no shorter or longer code part (a cut into the code or into
+// the state) passes. Close takes no _codePart: it writes no continuation, and
+// it reads the state as the scriptCode's last 251 bytes.
 
-type advState struct {
-	a, b                                int64
-	lp, val, id, nonce, feeA, feeB, aff []byte
+func advFlip(b []byte, i int) []byte {
+	c := append([]byte{}, b...)
+	c[i] ^= 0x01
+	return c
 }
 
-func advStateOf(p pair, aff []byte) advState {
+type advState struct {
+	a, b                                       int64
+	lp, val, id, nonce, feeA, feeB, affR, affS []byte
+}
+
+func advStateOf(p pair) advState {
 	val := make([]byte, 33)
 	if !p.rescinded {
 		val = p.validator.PubKey().Compressed()
 	}
 	return advState{a: p.a, b: p.b, lp: p.lp.PubKey().Compressed(), val: val,
-		id: validatorIdentity.PubKey().Compressed(), nonce: nonce, feeA: lpFeeAPkh, feeB: lpFeeBPkh, aff: aff}
+		id: validatorIdentity.PubKey().Compressed(), nonce: nonce, feeA: lpFeeAPkh, feeB: lpFeeBPkh,
+		affR: affirmationR, affS: affirmationS}
+}
+
+// raw concatenates the state's fields at whatever width they have.
+func (s advState) raw() []byte {
+	b := make([]byte, 16)
+	for i := 0; i < 8; i++ {
+		b[i], b[8+i] = byte(uint64(s.a)>>(8*i)), byte(uint64(s.b)>>(8*i))
+	}
+	for _, f := range [][]byte{s.lp, s.val, s.id, s.nonce, s.feeA, s.feeB, s.affR, s.affS} {
+		b = append(b, f...)
+	}
+	return b
 }
 
 // advSDKScript is the SDK's locking script (code || OP_RETURN || state) for
@@ -1933,36 +2585,16 @@ func (f *fixture) advSDKScript(t testing.TB, s advState) (full []byte, err error
 	sa := advArt(t).sa
 	h := hex.EncodeToString
 	c := runar.NewRunarContract(&sa, []interface{}{
-		s.a, s.b, h(s.lp), h(s.val), h(s.id), h(s.nonce), h(s.feeA), h(s.feeB), h(s.aff),
-		h(assetA), h(assetB), h(f.advVaultHash()), f.bps[0], f.bps[1], f.bps[2],
+		s.a, s.b, h(s.lp), h(s.val), h(s.id), h(s.nonce), h(s.feeA), h(s.feeB), h(s.affR), h(s.affS),
+		h(f.idA), h(f.idB), h(f.advVaultHash()), f.bps[0], f.bps[1], f.bps[2],
 	})
 	return hex.DecodeString(c.GetLockingScript())
 }
 
-// advSDKTail is OP_RETURN || state as the SDK frames it.
-func (f *fixture) advSDKTail(t testing.TB, s advState) []byte {
-	t.Helper()
-	full, err := f.advSDKScript(t, s)
-	if err != nil {
-		t.Fatal(err)
-	}
-	code := advCodeFor(t, assetA, assetB, f.advVaultHash(), f.bps)
-	if !bytes.HasPrefix(full, code) || full[len(code)] != 0x6a {
-		t.Fatal("SDK script does not start with its own code part")
-	}
-	return full[len(code):]
-}
-
-// advSDKLock is the pool output for s: A's prefix, f.code, the SDK's tail.
-func (f *fixture) advSDKLock(t testing.TB, s advState) []byte {
-	t.Helper()
-	return append(append(tokenPrefix(assetA, s.a), f.code...), f.advSDKTail(t, s)...)
-}
-
-// advHandSplice instantiates the template as an off-chain builder that knows
-// constructorSlots and codeSepIndexSlots but not codePartLenSlots would; it
-// returns the code and the built-code offsets of the template's length fields.
-func advHandSplice(t testing.TB, f *fixture) (code []byte, pins []int) {
+// advHandSplice instantiates the template as an off-chain builder would:
+// each constructor slot's OP_0 placeholder replaced by the argument's push,
+// each codeSepIndex slot (none here) resolved to OP_1.
+func advHandSplice(t testing.TB, f *fixture) []byte {
 	t.Helper()
 	a := advArt(t)
 	type sub struct {
@@ -1971,9 +2603,6 @@ func advHandSplice(t testing.TB, f *fixture) (code []byte, pins []int) {
 	}
 	var subs []sub
 	for _, cs := range a.CodeSepIndexSlots {
-		if cs.CodeSepIndex != 1 || a.template[cs.ByteOffset] != 0x00 {
-			t.Fatalf("codeSepIndex slot %+v", cs)
-		}
 		subs = append(subs, sub{cs.ByteOffset, []byte{0x51}})
 	}
 	for _, s := range a.ConstructorSlots {
@@ -1982,212 +2611,88 @@ func advHandSplice(t testing.TB, f *fixture) (code []byte, pins []int) {
 		}
 		var enc []byte
 		switch s.ParamIndex {
-		case 9:
-			enc = pushData(assetA)
 		case 10:
-			enc = pushData(assetB)
+			enc = pushData(f.idA)
 		case 11:
+			enc = pushData(f.idB)
+		case 12:
 			enc = pushData(f.advVaultHash())
-		case 12, 13, 14:
-			enc = pushNum(f.bps[s.ParamIndex-12])
+		case 13, 14, 15:
+			enc = pushNum(f.bps[s.ParamIndex-13])
 		default:
 			t.Fatalf("unexpected constructor slot param %d", s.ParamIndex)
 		}
 		subs = append(subs, sub{s.ByteOffset, enc})
-	}
-	for _, pin := range a.CodePartLenSlots {
-		shift := 0
-		for _, s := range subs {
-			if s.off < pin.ByteOffset {
-				shift += len(s.enc) - 1
-			}
-		}
-		pins = append(pins, pin.ByteOffset+shift)
 	}
 	for i := 1; i < len(subs); i++ { // descending by offset
 		for j := i; j > 0 && subs[j].off > subs[j-1].off; j-- {
 			subs[j], subs[j-1] = subs[j-1], subs[j]
 		}
 	}
-	code = append([]byte{}, a.template...)
+	code := append([]byte{}, a.template...)
 	for _, s := range subs {
 		code = append(append(append([]byte{}, code[:s.off]...), s.enc...), code[s.off+1:]...)
 	}
-	return code, pins
+	return code
 }
 
-// advPins finds the template's code-part length checks: 04 <LE len>
-// OP_BIN2NUM then OP_NUMEQUAL OP_VERIFY (an exact pin, eq) or
-// OP_GREATERTHANOREQUAL OP_VERIFY (a lower bound). It returns the offsets of
-// the length fields and the value they hold.
-func advPins(tpl []byte) (eq, ge []int, value int) {
-	for i := 0; i+8 <= len(tpl); i++ {
-		if tpl[i] != 0x04 || tpl[i+5] != 0x81 || tpl[i+7] != 0x69 || (tpl[i+6] != 0x9c && tpl[i+6] != 0xa2) {
-			continue
-		}
-		v := int(tpl[i+1]) | int(tpl[i+2])<<8 | int(tpl[i+3])<<16 | int(tpl[i+4])<<24
-		if v < len(tpl)/2 || v > 2*len(tpl) {
-			continue // not a code-part length
-		}
-		if tpl[i+6] == 0x9c {
-			eq = append(eq, i+1)
-		} else {
-			ge = append(ge, i+1)
-		}
-		value = v
-	}
-	return eq, ge, value
-}
-
-// advBound is the length the compiled template's check holds (the pinned
-// lower bound; at HEAD the value a deployer that does not patch leaves).
-func advBound(t testing.TB) int {
-	_, _, v := advPins(advArt(t).template)
-	if v == 0 {
-		t.Fatal("no code-part length check in the template")
-	}
-	return v
-}
-
-func TestAdvHead_ToolchainShape(t *testing.T) {
+func TestAdv_CompiledShape(t *testing.T) {
 	a := advArt(t)
 	f := advFix(t, [3]int64{30, 5, 10})
-	eq, ge, v := advPins(a.template)
-	t.Logf("ADV-RECORD %s | template %d bytes, compiled length check holds %d, SDK code %d bytes, codePartLenSlots %v, exact pins at %v, lower bounds at %v",
-		advToolchain(t), len(a.template), v, len(f.code), a.CodePartLenSlots, eq, ge)
+	t.Logf("ADV-RECORD %s | template %d bytes, deployed code %d bytes (fees 30/5/10)", advToolchain(t), len(a.template), len(f.code))
 	if !bytes.HasPrefix(a.template, []byte{0x61, 0xab}) {
 		t.Fatalf("template starts %x", a.template[:2])
 	}
-	if a.head {
-		if len(eq) != 3 || len(ge) != 0 || len(a.CodePartLenSlots) != 3 {
-			t.Fatalf("HEAD: %d exact pins, %d lower bounds, %d slots", len(eq), len(ge), len(a.CodePartLenSlots))
-		}
-		for i, s := range a.CodePartLenSlots {
-			if s.ByteOffset != eq[i] {
-				t.Fatalf("slot %d is not at an exact pin (%v)", s.ByteOffset, eq)
-			}
-		}
-	} else {
-		if len(ge) != 3 || len(eq) != 0 {
-			t.Fatalf("pinned: %d lower bounds, %d exact pins", len(ge), len(eq))
-		}
-		// The bound is below the deployed code's length (the AssetIds are
-		// spliced in at a width the compiler does not know): _codePart cuts
-		// inside the code above the bound clear the length check.
-		t.Logf("ADV-RECORD pinned | lower bound %d < code %d: in-code cuts in [%d, %d) clear the length check", v, len(f.code), v, len(f.code))
+	// No variable-length state field: nothing for a deployer to patch, and
+	// the separator's position is fixed.
+	if len(a.CodePartLenSlots) != 0 || len(a.CodeSepIndexSlots) != 0 {
+		t.Fatalf("codePartLenSlots %v, codeSepIndexSlots %v", a.CodePartLenSlots, a.CodeSepIndexSlots)
+	}
+	// Clause 8a, once in each method that takes _codePart (Swap, Rescind).
+	if n := strings.Count(a.ASM, "OP_SIZE <fc00> OP_NUMEQUALVERIFY"); n != 2 {
+		t.Fatalf("remainder-length checks: %d, want 2", n)
+	}
+	if len(f.poolLock(fresh())) != len(tokenPrefix(f.idA, fresh().a))+len(f.code)+1+advStateLen {
+		t.Fatal("pool output is not prefix || code || 6a || 251-byte state")
 	}
 }
 
-// At HEAD the SDK patches each length field to the deployed code's length.
-func TestAdvHead_SDKPoolPinsItsCodeLength(t *testing.T) {
-	for _, bps := range [][3]int64{{0, 0, 0}, {30, 5, 10}, {16, 17, 1}, {10000, 0, 0}} {
-		f := advFix(t, bps)
-		_, pins := advHandSplice(t, f)
-		if advIsHead(t) {
-			if len(pins) != 3 {
-				t.Fatalf("%d pins", len(pins))
-			}
-			for _, off := range pins {
-				got := int(f.code[off]) | int(f.code[off+1])<<8 | int(f.code[off+2])<<16 | int(f.code[off+3])<<24
-				if f.code[off-1] != 0x04 || got != len(f.code) {
-					t.Fatalf("bps %v pin at %d: %x (value %d, code %d bytes)", bps, off, f.code[off-1:off+7], got, len(f.code))
-				}
-			}
-		}
-		p := fresh()
-		mustPass(t, advH(t, f, f.close(p)))
-		rs, _ := f.rescind(p)
-		mustPass(t, advH(t, f, rs))
-		if bps[0] < 10000 {
-			s, _ := f.swap(p, 40_000, true)
-			mustPass(t, advH(t, f, s))
-		}
-	}
-}
-
-// An off-chain builder that splices constructor args at constructorSlots and
-// resolves codeSepIndexSlots, knowing nothing of codePartLenSlots, leaves the
-// template's length in every pin at HEAD: every method fails, Close included,
-// and token A and token B sent to such a pair are locked for good. Patching
-// the three length fields gives the SDK's bytes.
-func TestAdvHead_HandSplicedCodeLocksBothReserves(t *testing.T) {
-	a := advArt(t)
-	for _, bps := range [][3]int64{{0, 0, 0}, {30, 5, 10}, {16, 17, 1}} {
+// With no length slot and no separator slot, a template with the constructor
+// arguments spliced in at constructorSlots is the SDK's code, for every fee
+// configuration, and spends.
+func TestAdv_HandSplicedTemplateIsTheSDKCode(t *testing.T) {
+	for _, bps := range [][3]int64{{0, 0, 0}, {16, 16, 16}, {30, 5, 10}, {16, 17, 1}, {17, 0, 0}, {0, 0, 1000}, {9999, 0, 0}} {
 		bps := bps
 		t.Run(fmt.Sprintf("bps %v", bps), func(t *testing.T) {
 			f := advFix(t, bps)
-			hand, pins := advHandSplice(t, f)
-			if len(hand) != len(f.code) {
-				t.Fatalf("hand-spliced %d bytes, SDK %d", len(hand), len(f.code))
-			}
-			patched := append([]byte{}, hand...)
-			for _, off := range pins {
-				n := len(patched)
-				patched[off], patched[off+1], patched[off+2], patched[off+3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
-			}
-			if !a.head {
-				if !bytes.Equal(hand, f.code) {
-					t.Fatal("pinned: the hand splice differs from the SDK code")
-				}
-			} else {
-				if bytes.Equal(hand, f.code) {
-					t.Fatal("HEAD: the hand splice equals the SDK code")
-				}
-				for i := range hand {
-					if hand[i] == f.code[i] {
-						continue
-					}
-					inPin := false
-					for _, off := range pins {
-						inPin = inPin || (i >= off && i < off+4)
-					}
-					if !inPin {
-						t.Fatalf("hand splice differs outside the length fields at %d", i)
-					}
-				}
-				for _, off := range pins {
-					if v := int(hand[off]) | int(hand[off+1])<<8; v != advBound(t) {
-						t.Fatalf("hand-spliced pin at %d holds %d, want the template's %d", off, v, advBound(t))
-					}
-				}
-			}
-			if !bytes.Equal(patched, f.code) {
-				t.Fatal("patching the length fields does not give the SDK's code")
+			hand := advHandSplice(t, f)
+			if !bytes.Equal(hand, f.code) {
+				t.Fatalf("hand splice (%d bytes) differs from the SDK code (%d bytes)", len(hand), len(f.code))
 			}
 			g := *f
 			g.code = hand
 			p := fresh()
-			sw, _ := g.swap(p, 40_000, true)
+			sw, _ := g.swap(p, 4_000_000, true)
 			rs, _ := g.rescind(p)
-			for i, s := range []spend{sw, g.close(p), rs} {
-				advCheck(t, fmt.Sprintf("bps %v hand-spliced pair: %s", bps, advMethodNames[i]), advH(t, &g, s), advFail, advPass)
-			}
-			h := *f
-			h.code = patched
-			mustPass(t, advH(t, &h, h.close(p)))
+			mustPass(t, advH(t, &g, sw))
+			mustPass(t, advH(t, &g, g.close(p)))
+			mustPass(t, advH(t, &g, rs))
 		})
 	}
 }
 
-func advFlip(b []byte, i int) []byte {
-	c := append([]byte{}, b...)
-	c[i] ^= 0x01
-	return c
-}
-
-// _codePart tampering on an SDK-built pair, every method.
-func TestAdvHead_CodePartTampering(t *testing.T) {
+// _codePart tampering. Swap and Rescind refuse every variant (clause 8a, 8b
+// or the byte comparison). Close takes no code part: one pushed anyway is a
+// push below the arguments that Close ignores, so the LP's Close still
+// passes and every other signer's still fails.
+func TestAdv_CodePartWitness(t *testing.T) {
 	a := advArt(t)
 	f := advFix(t, [3]int64{30, 5, 10})
 	p := fresh()
 	sw, _ := f.swap(p, 40_000, true)
 	rs, _ := f.rescind(p)
-	calls := []spend{sw, f.close(p), rs}
-	for _, s := range calls {
-		mustPass(t, advRun(t, f, s, advOpts{codePart: f.code}))
-	}
 	other := advCodeFor(t, bytes.Repeat([]byte{0xc7}, 32), assetB, f.advVaultHash(), f.bps)
-	for _, tc := range []struct {
+	variants := []struct {
 		name string
 		cp   []byte
 	}{
@@ -2198,83 +2703,62 @@ func TestAdvHead_CodePartTampering(t *testing.T) {
 		{"middle byte flipped", advFlip(f.code, len(f.code)/2)},
 		{"last byte flipped", advFlip(f.code, len(f.code)-1)},
 		{"empty", []byte{}},
+		{"the two prologue bytes", []byte{0x61, 0xab}},
 		{"the template", a.template},
 		{"another pool's code (other AssetIdA)", other},
-	} {
-		for i, s := range calls {
-			tc, s := tc, s
-			t.Run(tc.name+": "+advMethodNames[i], func(t *testing.T) {
-				advCheck(t, "codePart "+tc.name+" "+advMethodNames[i], advRun(t, f, s, advOpts{codePart: tc.cp}), advFail, advRecord)
-			})
+	}
+	for _, m := range []struct {
+		name string
+		s    spend
+	}{{"Swap", sw}, {"Rescind", rs}} {
+		mustPass(t, advH(t, f, m.s))
+		for _, v := range variants {
+			advCheck(t, "codePart "+v.name+": "+m.name, advRun(t, f, m.s, advOpts{codePart: v.cp}), advFail)
+		}
+		advCheck(t, "codePart omitted: "+m.name, advRun(t, f, m.s, advOpts{rawCode: []byte{}}), advFail)
+	}
+	cl := f.close(p)
+	for _, v := range append(variants, struct {
+		name string
+		cp   []byte
+	}{"the real code", f.code}) {
+		advCheck(t, "Close with a code part pushed first ("+v.name+"), the LP signing", advRun(t, f, cl, advOpts{codePart: v.cp}), advPass)
+		for _, k := range []*ec.PrivateKey{p.validator, validatorIdentity} {
+			advCheck(t, "Close with a code part pushed first ("+v.name+"), another key signing", advRun(t, f, advWithSigner(cl, k), advOpts{codePart: v.cp}), advFail)
 		}
 	}
-	// Extended by one byte where the byte after it is 0x6a too: ReserveA's
-	// low byte 0x6a.
-	t.Run("extended by 6a with ReserveA's low byte 0x6a", func(t *testing.T) {
-		q := fresh()
-		q.a = 0x4c4b6a
-		sw, _ := f.swap(q, 40_000, true)
-		rs, _ := f.rescind(q)
-		for i, s := range []spend{sw, f.close(q), rs} {
-			mustPass(t, advH(t, f, s))
-			advCheck(t, "codePart code||6a, ReserveA low byte 6a: "+advMethodNames[i], advRun(t, f, s, advOpts{codePart: append(append([]byte{}, f.code...), 0x6a)}), advFail, advRecord)
-		}
-	})
 }
 
-// advCutRecord collects pinned code-part-cut acceptances for the summary log.
-type advCutRecord struct {
-	mu   sync.Mutex
-	hits []string
-}
-
-func (c *advCutRecord) add(s string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.hits = append(c.hits, s)
-}
-
-// advCutClose runs the LP's Close of the pool whose lock is lock, with
-// _codePart cut at k (the script after its prefix, body[:k]) and signed by k.
-func advCutClose(t *testing.T, f *fixture, p pair, lock []byte, k int, signer *ec.PrivateKey) result {
+// advCloseBy is the Close of the pool whose lock is lock, signed by signer
+// and paying everything to signer, with push (if not nil) as an extra first
+// push.
+func advCloseBy(t *testing.T, f *fixture, p pair, lock []byte, signer *ec.PrivateKey, push []byte) result {
 	t.Helper()
 	s := advCopy(f.close(p))
 	s.ins[0].lock = lock
 	s.signer = signer
-	thief := pkh(signer)
-	s.outs = []out{{1, tokenP2pkh(assetA, p.a, thief)}, {1, tokenP2pkh(assetB, p.b, thief)}}
-	body := lock[len(tokenPrefix(assetA, p.a)):]
-	return advRun(t, f, s, advOpts{codePart: body[:k]})
+	to := pkh(signer)
+	s.outs = []out{{1, tokenP2pkh(f.idA, p.a, to)}, {1, tokenP2pkh(f.idB, p.b, to)}}
+	return advRun(t, f, s, advOpts{codePart: push})
 }
 
-// On pinned, _codePart may run past the code into the state (any cut k >= the
-// template length with script[k] == 0x6a clears the lower bound), and the
-// state is then read from script[k+1:], every field moved by j+1 bytes for a
-// cut at state byte j. Here LpPubKey is at state byte 16, so a key with 0x6a
-// at byte 16 moves the next key onto LpPubKey: LpPubKey[16] = 0x6a lets the
-// ValidatorPubKey holder Close the LP's pair, ValidatorPubKey[16] = 0x6a lets
-// the ValidatorIdentity holder Close it. Byte 24 (Pool's aligning
-// byte) moves the fields 41 bytes here: a window no one holds.
-// Every 0x6a state byte of each pool below is cut, for key bytes 1..32 of
-// both keys; Close is the oracle (no continuation), signed by the LP, the
-// validator, the identity key, and whoever holds the moved LpPubKey window.
-// HEAD's equality pin must reject every cut.
-func TestAdvHead_CodePartRunIntoState(t *testing.T) {
+// A code part cut into the state: _codePart = script[:k] with script[k] ==
+// 0x6a past the code, so that a reader taking the state from script[k+1:]
+// would see every field moved by j+1 bytes (a cut at state byte j); with 0x6a
+// at byte 16 of a key, the next key would land on LpPubKey. Swap and Rescind
+// refuse every such cut (clause 8a), signed by the validator or the identity
+// key, at every 0x6a state byte of the fresh pool and of pools whose LpPubKey
+// or ValidatorPubKey has 0x6a at byte 16 or 24. Close takes no code part; with
+// the cut pushed first anyway, no key but the LP's closes, the holder of the
+// moved LpPubKey window included.
+func TestAdv_CodePartCutIntoTheState(t *testing.T) {
 	f := advFix(t, [3]int64{30, 5, 10})
-	known := map[string]*ec.PrivateKey{}
-	names := map[string]string{}
-	addKnown := func(name string, k *ec.PrivateKey) {
-		known[string(k.PubKey().Compressed())] = k
-		names[string(k.PubKey().Compressed())] = name
-	}
-	var rec advCutRecord
 	type pl struct {
 		name string
 		p    pair
 	}
-	var pools []pl
-	pools = append(pools, pl{"the fresh pool", fresh()})
-	for b := 1; b < 33; b++ {
+	pools := []pl{{"the fresh pool", fresh()}}
+	for _, b := range []int{16, 24} {
 		kb := advKeyWithByte(t, b, 0x6a)
 		q := fresh()
 		q.lp = kb
@@ -2283,86 +2767,51 @@ func TestAdvHead_CodePartRunIntoState(t *testing.T) {
 		q.validator = kb
 		pools = append(pools, pl{fmt.Sprintf("ValidatorPubKey byte %d = 6a", b), q})
 	}
-	cuts, runs := 0, 0
+	cuts := 0
 	for _, x := range pools {
 		p := x.p
-		addKnown("LP", p.lp)
-		addKnown("validator", p.validator)
-		addKnown("identity", validatorIdentity)
+		known := map[string]*ec.PrivateKey{}
+		for _, k := range []*ec.PrivateKey{p.lp, p.validator, validatorIdentity} {
+			known[string(k.PubKey().Compressed())] = k
+		}
 		lock := f.poolLock(p)
+		body := lock[len(tokenPrefix(f.idA, p.a)):]
 		state := p.state()
+		sw, _ := f.swap(p, 40_000, true)
+		rs, _ := f.rescind(p)
 		for j := range state {
 			if state[j] != 0x6a {
 				continue
 			}
 			cuts++
 			k := len(f.code) + 1 + j
-			signers := []*ec.PrivateKey{p.lp, p.validator, validatorIdentity}
-			holder := ""
-			if s := j + 1; s+advOffLp+33 <= len(state) {
-				if hk, ok := known[string(state[s+advOffLp:s+advOffLp+33])]; ok {
-					holder = names[string(hk.PubKey().Compressed())]
-					dup := false
-					for _, sg := range signers {
-						dup = dup || sg == hk
-					}
-					if !dup {
-						signers = append(signers, hk)
-					}
-				}
-			}
-			for _, sg := range signers {
-				runs++
-				r := advCutClose(t, f, p, lock, k, sg)
-				who := names[string(sg.PubKey().Compressed())]
-				name := fmt.Sprintf("%s: Close with _codePart cut at state byte %d (fields moved %d bytes; moved LpPubKey held by %q), signed by %s", x.name, j, j+1, holder, who)
-				if r.pool == nil {
-					rec.add(name)
-				}
-				if advIsHead(t) && r.pool == nil {
-					t.Errorf("HEAD accepted: %s", name)
-				}
-				named := x.name == "the fresh pool" || strings.Contains(x.name, "byte 16 ") || strings.Contains(x.name, "byte 24 ")
-				if r.pool == nil || holder != "" || named {
-					t.Logf("ADV-RECORD %s | %s | pool=%v", advToolchain(t), name, advErrS(r.pool))
-				}
-			}
-			// Swap and Rescind under the same cut, with the honest
-			// continuation (not what a shifted state would write: recorded
-			// on pinned, rejected at HEAD).
-			if x.name != "the fresh pool" && !strings.Contains(x.name, "byte 16 ") && !strings.Contains(x.name, "byte 24 ") {
-				continue
-			}
-			sw, _ := f.swap(p, 40_000, true)
-			rs, _ := f.rescind(p)
-			body := lock[len(tokenPrefix(assetA, p.a)):]
 			for mi, m := range []spend{sw, rs} {
 				for _, sg := range []*ec.PrivateKey{p.validator, validatorIdentity} {
-					runs++
-					r := advRun(t, f, advWithSigner(m, sg), advOpts{codePart: body[:k]})
-					name := fmt.Sprintf("%s: %s with _codePart cut at state byte %d, honest continuation, signed by %s", x.name, []string{"Swap", "Rescind"}[mi], j, names[string(sg.PubKey().Compressed())])
-					if r.pool == nil {
-						rec.add(name)
-						if advIsHead(t) {
-							t.Errorf("HEAD accepted: %s", name)
-						}
-					}
-					t.Logf("ADV-RECORD %s | %s | pool=%v", advToolchain(t), name, advErrS(r.pool))
+					advCheck(t, fmt.Sprintf("%s: %s with _codePart cut at state byte %d, signed by key %x", x.name, []string{"Swap", "Rescind"}[mi], j, sg.Serialize()[0]),
+						advRun(t, f, advWithSigner(m, sg), advOpts{codePart: body[:k]}), advFail)
 				}
 			}
+			holder := "nobody"
+			if sh := j + 1; sh+advOffLp+33 <= len(state) {
+				if hk, ok := known[string(state[sh+advOffLp:sh+advOffLp+33])]; ok {
+					holder = fmt.Sprintf("key %x", hk.Serialize()[0])
+				}
+			}
+			for _, sg := range []*ec.PrivateKey{p.validator, validatorIdentity} {
+				advCheck(t, fmt.Sprintf("%s: Close with the cut at state byte %d pushed first (moved LpPubKey held by %s), signed by key %x", x.name, j, holder, sg.Serialize()[0]),
+					advCloseBy(t, f, p, lock, sg, body[:k]), advFail)
+			}
+			advCheck(t, fmt.Sprintf("%s: the LP's Close with the cut at state byte %d pushed first", x.name, j), advCloseBy(t, f, p, lock, p.lp, body[:k]), advPass)
 		}
 	}
-	t.Logf("ADV-RECORD %s | %d pools, %d state cuts, %d runs (Close for all; Swap and Rescind for the fresh, byte-16 and byte-24 pools), %d accepted", advToolchain(t), len(pools), cuts, runs, len(rec.hits))
-	for _, h := range rec.hits {
-		t.Logf("ADV-RECORD %s | ACCEPTED: %s", advToolchain(t), h)
-	}
+	t.Logf("ADV-RECORD %s | %d pools, %d state cuts, none accepted for Swap or Rescind, no non-LP Close", advToolchain(t), len(pools), cuts)
 }
 
-// The validator rotates to a next key whose byte 16 is 0x6a with one ordinary
-// Swap (the contract never checks the bytes; raw bytes need no grinding, a
-// real key ~256 tries), then the identity key Closes with a cut at state byte
-// 65. The Swap is honest on both toolchains; the theft must fail at HEAD.
-func TestAdvHead_ValidatorRotatesThenIdentityClosesViaCut(t *testing.T) {
+// The validator rotates, with one ordinary Swap, to a next key whose byte 16
+// is 0x6a (raw bytes or a ground real key; both pass the type and width
+// checks). The identity key still cannot Close the pair, with or without
+// bytes pushed first; the LP can.
+func TestAdv_RotationToAKeyWith6aAtByte16(t *testing.T) {
 	f := advFix(t, [3]int64{30, 5, 10})
 	p := fresh()
 	raw := append([]byte{0x02}, bytes.Repeat([]byte{0x11}, 32)...)
@@ -2377,172 +2826,112 @@ func TestAdvHead_ValidatorRotatesThenIdentityClosesViaCut(t *testing.T) {
 			mustPass(t, advH(t, f, s))
 			after := r.after
 			lock := f.advLockState(after.a, advStateVal(after, nk.b))
-			k := len(f.code) + 1 + advOffVal + 16
-			body := lock[len(tokenPrefix(assetA, after.a)):]
-			if body[k] != 0x6a {
-				t.Fatalf("byte %d is %#x", k, body[k])
-			}
-			ctl := advCopy(f.close(after))
-			ctl.ins[0].lock = lock
-			mustPass(t, advH(t, f, ctl))
-			mustFailPool(t, advH(t, f, advWithSigner(ctl, validatorIdentity)))
-			advCheck(t, "theft: Swap to a next key with byte 16 = 6a, then identity Close via a cut at state byte 65 ("+nk.name+")",
-				advCutClose(t, f, after, lock, k, validatorIdentity), advFail, advRecord)
+			body := lock[len(tokenPrefix(f.idA, after.a)):]
+			mustPass(t, advCloseBy(t, f, after, lock, p.lp, nil))
+			mustFailPool(t, advCloseBy(t, f, after, lock, validatorIdentity, nil))
+			mustFailPool(t, advCloseBy(t, f, after, lock, validatorIdentity, body[:len(f.code)+1+advOffVal+16]))
 		})
 	}
 }
 
-// On pinned the lower bound lies inside this contract's code: every 0x6a
-// byte of the code at or above it is a cut the length check accepts, the
-// "state" then read from the code's own bytes. AssetIdA and AssetIdB of 32
-// 0x6a bytes multiply the candidates. Close by the LP, the validator and the
-// identity key; recorded on pinned, rejected at HEAD.
-func TestAdvHead_CodePartCutInsideCodeAboveTheBound(t *testing.T) {
-	base := advFix(t, [3]int64{30, 5, 10})
+// Cuts inside the code: Swap and Rescind with _codePart = code[:k] at every
+// 0x6a byte of the code (asset ids of 0x6a bytes multiply them), refused by
+// clause 8a.
+func TestAdv_CodePartCutInsideTheCode(t *testing.T) {
 	six := bytes.Repeat([]byte{0x6a}, 32)
-	for _, v := range []struct {
-		name string
-		a, b []byte
-	}{{"SDK asset ids", assetA, assetB}, {"AssetIdA = AssetIdB = 32 x 6a", six, six}} {
-		v := v
-		t.Run(v.name, func(t *testing.T) {
-			g := *base
-			g.code = advCodeFor(t, v.a, v.b, base.advVaultHash(), base.bps)
-			p := fresh()
-			lock := append(append(tokenPrefix(v.a, p.a), g.code...), 0x6a)
-			lock = append(lock, p.state()...)
-			ctl := advCopy(g.close(p))
-			ctl.ins[0].lock = lock
-			mustPass(t, advH(t, &g, ctl))
-			n, acc := 0, 0
-			for k := advBound(t); k < len(g.code); k++ {
-				if g.code[k] != 0x6a {
-					continue
-				}
-				n++
-				for _, sg := range []*ec.PrivateKey{p.lp, p.validator, validatorIdentity} {
-					s := advCopy(ctl)
-					s.signer = sg
-					body := lock[len(tokenPrefix(v.a, p.a)):]
-					r := advRun(t, &g, s, advOpts{codePart: body[:k]})
-					if r.pool == nil {
-						acc++
-						t.Logf("ADV-RECORD %s | ACCEPTED: in-code cut at %d (%s)", advToolchain(t), k, v.name)
-						if advIsHead(t) {
-							t.Errorf("HEAD accepted an in-code cut at %d", k)
-						}
-					}
-				}
+	f := advFixIDs(t, six, append(bytes.Repeat([]byte{0x6a}, 31), 0x6b), [3]int64{30, 5, 10})
+	p := fresh()
+	sw, _ := advBuildSwap(f, p, advSwap{amountIn: 40_000, aIn: true})
+	rs, _ := f.rescind(p)
+	mustPass(t, advH(t, f, sw))
+	mustPass(t, advH(t, f, rs))
+	n := 0
+	for k := 1; k < len(f.code); k++ {
+		if f.code[k] != 0x6a {
+			continue
+		}
+		n++
+		for _, m := range []spend{sw, rs} {
+			if advRun(t, f, m, advOpts{codePart: f.code[:k]}).pool == nil {
+				t.Errorf("ACCEPTED: %s with _codePart cut at code byte %d", advMethodNames[m.method], k)
 			}
-			t.Logf("ADV-RECORD %s | %s: %d in-code 0x6a cuts in [%d, %d), %d accepted", advToolchain(t), v.name, n, advBound(t), len(g.code), acc)
-		})
+		}
 	}
+	t.Logf("ADV-RECORD %s | %d in-code 0x6a cuts, Swap and Rescind each refused", advToolchain(t), n)
 }
 
-// A fake state hidden in the Affirmation: 0x6a || a complete state whose
-// LpPubKey is the thief's. On pinned a cut at that 0x6a reads the fake state
-// (trailing bytes dropped), so whoever chose the Affirmation Closes the pair.
-// Off-chain check carrying the weight on pinned: the lookup bounds and
-// validates the Affirmation (a DER signature cannot carry this). HEAD's
-// equality pin rejects it. The Affirmation is >= 256 bytes so the honest LP
-// Close works on both toolchains (128..255 misparse on pinned, see below).
-func TestAdvHead_FakeStateInsideTheAffirmation(t *testing.T) {
+// A cut at a 0x6a inside the affirmation (a deploy chooses its 64 bytes):
+// AffirmationR starting 0x6a, and the rest of it and AffirmationS chosen as
+// the head of a state naming the deployer's key. 64 bytes cannot hold a
+// 251-byte state, and clause 8a refuses the cut regardless: Swap and Rescind
+// refuse it. The deployer's key cannot Close the pair either.
+func TestAdv_CodePartCutIntoTheAffirmation(t *testing.T) {
 	f := advFix(t, [3]int64{30, 5, 10})
 	p := fresh()
 	thief := key(0x5b)
-	fake := advStateOf(p, nil)
-	fake.lp = thief.PubKey().Compressed()
-	var fs []byte
-	fs = append(fs, p.state()[:16]...)
-	for _, b := range [][]byte{fake.lp, fake.val, fake.id, fake.nonce, fake.feeA, fake.feeB} {
-		fs = append(fs, b...)
+	head := append(append(make([]byte, 16), thief.PubKey().Compressed()...), make([]byte, 14)...) // 63 bytes
+	st := advStateOf(p)
+	st.affR = append([]byte{0x6a}, head[:31]...)
+	st.affS = head[31:63]
+	lock := f.advLockState(p.a, st.raw())
+	sdk, err := f.advSDKScript(t, st)
+	if err != nil || !bytes.Equal(append(tokenPrefix(f.idA, p.a), sdk...), lock) {
+		t.Fatalf("SDK lock differs from the hand-built one (%v)", err)
 	}
-	fs = append(fs, 0x00) // an empty Affirmation
-	aff := append(bytes.Repeat([]byte{0x30}, 8), 0x6a)
-	aff = append(aff, fs...)
-	for len(aff) < 300 {
-		aff = append(aff, 0x31)
+	mustPass(t, advCloseBy(t, f, p, lock, p.lp, nil))
+	k := len(f.code) + 1 + advOffAffR
+	body := lock[len(tokenPrefix(f.idA, p.a)):]
+	sw, _ := f.swap(p, 40_000, true)
+	sw.ins[0].lock = lock
+	rs, _ := f.rescind(p)
+	rs.ins[0].lock = lock
+	for _, sg := range []*ec.PrivateKey{p.validator, thief} {
+		advCheck(t, "Swap with _codePart cut at AffirmationR's 6a", advRun(t, f, advWithSigner(sw, sg), advOpts{codePart: body[:k]}), advFail)
+		advCheck(t, "Rescind with _codePart cut at AffirmationR's 6a", advRun(t, f, advWithSigner(rs, sg), advOpts{codePart: body[:k]}), advFail)
 	}
-	st := advStateOf(p, aff)
-	lock := f.advSDKLock(t, st)
-	ctl := advCopy(f.close(p))
-	ctl.ins[0].lock = lock
-	mustPass(t, advH(t, f, ctl))
-	mustFailPool(t, advH(t, f, advWithSigner(ctl, thief)))
-	body := lock[len(tokenPrefix(assetA, p.a)):]
-	k := bytes.Index(body[len(f.code)+1+advOffAffLen:], append([]byte{0x6a}, fs[:8]...)) + len(f.code) + 1 + advOffAffLen
-	if body[k] != 0x6a || !bytes.Equal(body[k+1:k+1+len(fs)], fs) {
-		t.Fatal("fake state not found where expected")
-	}
-	advCheck(t, "theft: Close by the Affirmation's chooser via a cut at a fake state inside the Affirmation",
-		advCutClose(t, f, p, lock, k, thief), advFail, advRecord)
+	advCheck(t, "Close by the affirmation's chooser, the cut pushed first", advCloseBy(t, f, p, lock, thief, body[:k]), advFail)
 }
 
-// Swap with a nextValidatorPubKey that is not 33 bytes. HEAD's state writer
-// asserts the width. Pinned writes it raw, poolScript taking the
-// continuation's code as scriptCode minus the NEW state's length, so a width
-// w moves 33-w bytes between the code region and the state.
-func TestAdvHead_SwapNextValidatorKeyWidth(t *testing.T) {
+// Swap with a nextValidatorPubKey of any width but 33, whatever its first
+// byte, is refused by the contract's own width check on both compilers. Each
+// case carries the continuation the compiler's poolScript would write for a
+// key of w bytes (the spent script's first len(code)+1+33-w bytes, then the
+// state), the shape that once let a validator lock both reserves on the
+// pinned compiler. (A continuation of code || 6a || state would be refused
+// by the outputs check alone, so it is not tried.) Were one accepted, the
+// LP's Close of what it wrote is tried and reported.
+func TestAdv_NextValidatorKeyWidth(t *testing.T) {
 	f := advFix(t, [3]int64{30, 5, 0})
 	p := fresh()
 	lock := f.poolLock(p)
-	body := lock[len(tokenPrefix(assetA, p.a)):]
+	body := lock[len(tokenPrefix(f.idA, p.a)):]
 	nk := advNext(p.validator)
-	for _, w := range []int{0, 1, 32, 34, 65} {
-		w := w
-		t.Run(fmt.Sprintf("%d bytes", w), func(t *testing.T) {
-			var b []byte
-			switch w {
-			case 65:
-				b = nk.PubKey().Uncompressed()
-			case 34:
-				b = append(nk.PubKey().Compressed(), 0x00)
-			default:
-				b = nk.PubKey().Compressed()[:w]
+	for _, first := range []byte{0x02, 0x03, 0x04, 0x00} {
+		for _, w := range []int{0, 1, 2, 32, 34, 64, 65} {
+			if w == 0 && first != 0x02 {
+				continue
 			}
-			s, r := advBuildSwap(f, p, advSwap{amountIn: 40_000, aIn: true, nextRaw: b})
-			newState := advStateVal(r.after, b)
-			keep := len(f.code) + 1 + 33 - w
-			written := append(append(tokenPrefix(assetA, r.after.a), body[:keep]...), newState...)
-			naive := f.advLockState(r.after.a, newState)
-			var wroteOK bool
-			for _, sh := range []struct {
-				name string
-				s    []byte
-			}{{"continuation as poolScript builds it", written}, {"continuation code || 6a || state", naive}} {
+			first, w := first, w
+			t.Run(fmt.Sprintf("first byte %02x, %d bytes", first, w), func(t *testing.T) {
+				b := append(append([]byte{}, nk.PubKey().Compressed()...), bytes.Repeat([]byte{0x5a}, 64)...)[:w]
+				if w > 0 {
+					b[0] = first
+				}
+				s, r := advBuildSwap(f, p, advSwap{amountIn: 40_000, aIn: true, nextRaw: b})
 				c := advCopy(s)
-				c.outs[0].script = sh.s
+				c.outs[0].script = append(append(tokenPrefix(f.idA, r.after.a), body[:len(f.code)+1+33-w]...), advStateVal(r.after, b)...)
 				res := advH(t, f, c)
-				advCheck(t, fmt.Sprintf("Swap nextValidatorPubKey %d bytes, %s", w, sh.name), res, advFail, advRecord)
-				if sh.name == "continuation as poolScript builds it" {
-					wroteOK = res.ok()
+				if res.ok() {
+					t.Errorf("LP Close of the pair a %02x / %d-byte next key wrote: pool %v", first, w, advErrS(advCloseBy(t, f, r.after, c.outs[0].script, p.lp, nil).pool))
 				}
-			}
-			if advIsHead(t) || !wroteOK {
-				return
-			}
-			// Pinned wrote it: can the LP still Close it?
-			next := r.after
-			ctl := advCopy(f.close(next))
-			ctl.ins[0].lock = written
-			advCheck(t, fmt.Sprintf("pinned: LP Close of the pair a %d-byte nextValidatorPubKey Swap wrote", w), advH(t, f, ctl), advFail, advRecord)
-			nb := written[len(tokenPrefix(assetA, next.a)):]
-			found := false
-			for k := advBound(t); k < len(nb); k++ {
-				if nb[k] == 0x6a && advRun(t, f, ctl, advOpts{codePart: nb[:k]}).pool == nil {
-					found = true
-					t.Logf("ADV-RECORD pinned | LP Close of the %d-byte-key pair passes with a %d-byte code part", w, k)
-				}
-			}
-			if !found {
-				t.Logf("ADV-RECORD pinned | LP Close of the %d-byte-key pair: no code part works", w)
-			}
-		})
+				advCheck(t, fmt.Sprintf("Swap next key %02x / %d bytes, continuation as poolScript builds it", first, w), res, advFail)
+			})
+		}
 	}
 }
 
 // Rescind writes ValidatorPubKey as exactly 33 zero bytes.
-func TestAdvHead_RescindWritesThirtyThreeZeroBytes(t *testing.T) {
+func TestAdv_RescindWritesThirtyThreeZeroBytes(t *testing.T) {
 	f := advFix(t, [3]int64{30, 5, 10})
 	p := fresh()
 	for _, w := range []int{33, 32, 34} {
@@ -2552,117 +2941,203 @@ func TestAdvHead_RescindWritesThirtyThreeZeroBytes(t *testing.T) {
 		if w == 33 {
 			want = advPass
 		}
-		advCheck(t, fmt.Sprintf("Rescind writing %d zero bytes", w), advH(t, f, rs), want, want)
+		advCheck(t, fmt.Sprintf("Rescind writing %d zero bytes", w), advH(t, f, rs), want)
 	}
 }
 
-// Bytes after the state on the spent pool. HEAD's reader asserts the state is
-// consumed: every method rejects. Pinned's reader drops the rest.
-func TestAdvHead_TrailingBytesAfterState(t *testing.T) {
+// advClosers runs the Close of the pool whose lock is lock by the LP, the
+// validator and the identity key, each to its own outputs, and returns who
+// passed.
+func advClosers(t *testing.T, f *fixture, p pair, lock []byte) map[string]bool {
+	t.Helper()
+	got := map[string]bool{}
+	for name, k := range map[string]*ec.PrivateKey{"LP": p.lp, "validator": p.validator, "identity": validatorIdentity} {
+		got[name] = advCloseBy(t, f, p, lock, k, nil).pool == nil
+	}
+	return got
+}
+
+// advSwapRescindRefused asserts Swap and Rescind of the pool whose lock is
+// lock are refused (the validator signing, the honest continuation).
+func advSwapRescindRefused(t *testing.T, f *fixture, p pair, lock []byte) {
+	t.Helper()
+	sw, _ := f.swap(p, 40_000, true)
+	rs, _ := f.rescind(p)
+	for _, m := range []spend{sw, rs} {
+		c := advCopy(m)
+		c.ins[0].lock = lock
+		mustFailPool(t, advH(t, f, c))
+	}
+}
+
+// TRUST MODEL. Close reads the state as the script's last 251 bytes, so
+// bytes appended after the state move every field, whatever they are. With
+// n filler bytes (0xee, no key) the LpPubKey Close checks is the spent
+// state's bytes 16+n..48+n: 33 and it is ValidatorPubKey (the validator
+// Closes, outputs free), 66 and it is ValidatorIdentity (the identity key
+// Closes); at 1, 32, 34 and 99 it is bytes no one holds (no one Closes, the
+// LP included: the pair is locked). Swap and Rescind refuse every such pool
+// (clause 8a). A whole second state appended is the state Close reads: its
+// LpPubKey Closes. Off-chain check carrying the weight: the lookup (and the
+// deploy's builder) refuse a pool whose script does not end exactly at the
+// 251-byte state.
+func TestTrustModel_BytesAfterTheStateMoveEveryField(t *testing.T) {
 	f := advFix(t, [3]int64{30, 5, 10})
 	p := fresh()
-	for _, ex := range []struct {
+	for _, tc := range []struct {
+		n      int
+		closer string // "" for nobody
+	}{{1, ""}, {32, ""}, {33, "validator"}, {34, ""}, {66, "identity"}, {99, ""}} {
+		tc := tc
+		t.Run(fmt.Sprintf("%d filler bytes", tc.n), func(t *testing.T) {
+			lock := append(f.poolLock(p), bytes.Repeat([]byte{0xee}, tc.n)...)
+			got := advClosers(t, f, p, lock)
+			t.Logf("ADV-RECORD %s | %d filler bytes after the state: Close by %v", advToolchain(t), tc.n, got)
+			for _, who := range []string{"LP", "validator", "identity"} {
+				if got[who] != (who == tc.closer) {
+					t.Errorf("Close by the %s: passed=%v, want %v", who, got[who], who == tc.closer)
+				}
+			}
+			advSwapRescindRefused(t, f, p, lock)
+		})
+	}
+	t.Run("a second state appended, naming a thief as LP", func(t *testing.T) {
+		thief := key(0x5d)
+		fake := p
+		fake.lp = thief
+		lock := append(f.poolLock(p), fake.state()...)
+		mustPass(t, advCloseBy(t, f, p, lock, thief, nil))
+		mustFailPool(t, advCloseBy(t, f, p, lock, p.lp, nil))
+		advSwapRescindRefused(t, f, p, lock)
+	})
+}
+
+// TRUST MODEL. A deploy whose state has a field one byte short or long:
+// the SDK refuses to build it at Rúnar main (the pinned SDK builds it,
+// recorded). Built by hand, Close reads the last 251 bytes, every field
+// before the misshapen one moved by a byte: no key Closes, the LP included,
+// and Swap and Rescind are refused, so the pair is locked. Two fields
+// swapped: the state is what it says, and whoever it names as LP Closes.
+// Off-chain check carrying the weight: the lookup's, that every field is at
+// its width and in its place.
+func TestTrustModel_MisshapenStateLocksThePair(t *testing.T) {
+	f := advFix(t, [3]int64{30, 5, 10})
+	p := fresh()
+	fields := []struct {
+		name string
+		get  func(s *advState) *[]byte
+	}{
+		{"LpPubKey", func(s *advState) *[]byte { return &s.lp }},
+		{"ValidatorPubKey", func(s *advState) *[]byte { return &s.val }},
+		{"ValidatorIdentity", func(s *advState) *[]byte { return &s.id }},
+		{"Nonce", func(s *advState) *[]byte { return &s.nonce }},
+		{"LpFeeAPkh", func(s *advState) *[]byte { return &s.feeA }},
+		{"LpFeeBPkh", func(s *advState) *[]byte { return &s.feeB }},
+		{"AffirmationR", func(s *advState) *[]byte { return &s.affR }},
+		{"AffirmationS", func(s *advState) *[]byte { return &s.affS }},
+	}
+	for _, fd := range fields {
+		for _, d := range []int{-1, 1} {
+			fd, d := fd, d
+			t.Run(fmt.Sprintf("%s %+d byte", fd.name, d), func(t *testing.T) {
+				st := advStateOf(p)
+				fp := fd.get(&st)
+				if d < 0 {
+					*fp = (*fp)[:len(*fp)-1]
+				} else {
+					*fp = append(append([]byte{}, *fp...), 0x99)
+				}
+				_, err := f.advSDKScript(t, st)
+				t.Logf("ADV-RECORD %s | %s %+d byte: the SDK builds it: %v", advToolchain(t), fd.name, d, err == nil)
+				if advIsHead(t) && err == nil {
+					t.Errorf("Rúnar main's SDK built a state with %s %+d byte", fd.name, d)
+				}
+				lock := f.advLockState(p.a, st.raw())
+				got := advClosers(t, f, p, lock)
+				if got["LP"] || got["validator"] || got["identity"] {
+					t.Errorf("Close passed for %v", got)
+				}
+				advSwapRescindRefused(t, f, p, lock)
+			})
+		}
+	}
+	for _, sw := range []struct {
 		name  string
-		extra []byte
-	}{{"one 00 byte", []byte{0x00}}, {"an extra push", []byte{0x02, 0xbe, 0xef}}} {
-		ex := ex
-		t.Run(ex.name, func(t *testing.T) {
-			lock := append(f.poolLock(p), ex.extra...)
-			body := lock[len(tokenPrefix(assetA, p.a)):]
-			sw, r := f.swap(p, 40_000, true)
-			rs, after := f.rescind(p)
-			for _, m := range []struct {
-				name     string
-				s        spend
-				newA     int64
-				newState []byte
-			}{{"Swap", sw, r.after.a, r.after.state()}, {"Close", f.close(p), 0, nil}, {"Rescind", rs, after.a, after.state()}} {
-				c := advCopy(m.s)
-				c.ins[0].lock = lock
-				if m.newState == nil {
-					advCheck(t, "trailing "+ex.name+": Close", advH(t, f, c), advFail, advRecord)
-					continue
-				}
-				advCheck(t, "trailing "+ex.name+": "+m.name+", the honest continuation", advH(t, f, c), advFail, advRecord)
-				c.outs[0].script = append(append(tokenPrefix(assetA, m.newA), body[:len(f.code)+1+len(ex.extra)]...), m.newState...)
-				advCheck(t, "trailing "+ex.name+": "+m.name+", continuation as poolScript builds it", advH(t, f, c), advFail, advRecord)
-			}
+		edit  func(s *advState)
+		names *ec.PrivateKey // the key the swapped state names as LP
+	}{
+		{"LpPubKey and ValidatorPubKey swapped", func(s *advState) { s.lp, s.val = s.val, s.lp }, p.validator},
+		{"Nonce and AffirmationR swapped", func(s *advState) { s.nonce, s.affR = s.affR, s.nonce }, p.lp},
+		{"LpFeeAPkh and LpFeeBPkh swapped", func(s *advState) { s.feeA, s.feeB = s.feeB, s.feeA }, p.lp},
+	} {
+		sw := sw
+		t.Run(sw.name, func(t *testing.T) {
+			st := advStateOf(p)
+			sw.edit(&st)
+			mustPass(t, advCloseBy(t, f, p, f.advLockState(p.a, st.raw()), sw.names, nil))
 		})
 	}
 }
 
-func advAff(n int) []byte {
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = byte(0x30 + i%7) // no 0x6a
-	}
-	return b
-}
-
-var advAffSizes = []int{0, 1, 71, 72, 73, 75, 76, 127, 128, 129, 255, 256}
-
-// The SDK's Affirmation framing: OP_0 when empty, a direct push below 76,
-// PUSHDATA1 to 255, PUSHDATA2 above.
-func TestAdvHead_AffirmationSDKFraming(t *testing.T) {
+// The affirmation is 64 opaque bytes: any values deploy and carry through
+// Swap, Swap, Rescind and Close unchanged; Rúnar main's SDK refuses either
+// half at any width but 32 (the pinned SDK's behaviour is recorded).
+func TestAdv_AffirmationIsOpaque(t *testing.T) {
 	f := advFix(t, [3]int64{30, 5, 10})
-	for _, n := range advAffSizes {
-		tail := f.advSDKTail(t, advStateOf(fresh(), advAff(n)))
-		frame := tail[1+advOffAffLen : len(tail)-n]
-		var want []byte
-		switch {
-		case n == 0:
-			want = []byte{0x00}
-		case n < 0x4c:
-			want = []byte{byte(n)}
-		case n <= 0xff:
-			want = []byte{0x4c, byte(n)}
-		default:
-			want = []byte{0x4d, byte(n), byte(n >> 8)}
-		}
-		if !bytes.Equal(frame, want) || !bytes.HasSuffix(tail, advAff(n)) {
-			t.Errorf("%d bytes: framing %x, want %x", n, frame, want)
-		}
-	}
-}
-
-// Swap (both directions) -> second Swap -> Rescind -> Close, and Close
-// directly, per Affirmation size, every continuation framed by the SDK.
-// HEAD: everything passes. Pinned: recorded.
-func TestAdvHead_AffirmationSizesLifecycle(t *testing.T) {
-	f := advFix(t, [3]int64{30, 5, 10})
-	for _, n := range advAffSizes {
-		n := n
-		aff := advAff(n)
-		lockOf := func(p pair) []byte { return f.advSDKLock(t, advStateOf(p, aff)) }
-		at := func(s spend, p pair) spend {
-			s = advCopy(s)
-			s.ins[0].lock = lockOf(p)
-			return s
-		}
-		t.Run(fmt.Sprintf("%d bytes", n), func(t *testing.T) {
+	sig, _ := key(0x21).Sign(advSha([]byte("pool")))
+	pad := func(b []byte) []byte { return append(make([]byte, 32-len(b)), b...) }
+	for _, v := range []struct {
+		name       string
+		affR, affS []byte
+	}{
+		{"zeros", make([]byte, 32), make([]byte, 32)},
+		{"ff", bytes.Repeat([]byte{0xff}, 32), bytes.Repeat([]byte{0xff}, 32)},
+		{"0x6a everywhere", bytes.Repeat([]byte{0x6a}, 32), bytes.Repeat([]byte{0x6a}, 32)},
+		{"a real signature's r and s", pad(sig.R.Bytes()), pad(sig.S.Bytes())},
+	} {
+		v := v
+		t.Run(v.name, func(t *testing.T) {
+			lockOf := func(p pair) []byte {
+				st := advStateOf(p)
+				st.affR, st.affS = v.affR, v.affS
+				full, err := f.advSDKScript(t, st)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return append(tokenPrefix(f.idA, p.a), full...)
+			}
+			at := func(s spend, p pair) spend {
+				s = advCopy(s)
+				s.ins[0].lock = lockOf(p)
+				return s
+			}
 			p := fresh()
-			advCheck(t, fmt.Sprintf("Affirmation %d: Close", n), advH(t, f, at(f.close(p), p)), advPass, advRecord)
-			for _, aIn := range []bool{true, false} {
-				s1, r1 := f.swap(p, 40_000, aIn)
-				s1 = at(s1, p)
-				s1.outs[0].script = lockOf(r1.after)
-				res := advH(t, f, s1)
-				advCheck(t, fmt.Sprintf("Affirmation %d: Swap %s", n, advDir(aIn)), res, advPass, advRecord)
-				if !res.ok() {
-					continue
-				}
-				p2 := r1.after
-				s2, r2 := f.swap(p2, 7_000, !aIn)
-				s2 = at(s2, p2)
-				s2.outs[0].script = lockOf(r2.after)
-				advCheck(t, fmt.Sprintf("Affirmation %d: Swap %s, Swap", n, advDir(aIn)), advH(t, f, s2), advPass, advRecord)
-				p3 := r2.after
-				s3, p4 := f.rescind(p3)
-				s3 = at(s3, p3)
-				s3.outs[0].script = lockOf(p4)
-				advCheck(t, fmt.Sprintf("Affirmation %d: Swap %s, Swap, Rescind", n, advDir(aIn)), advH(t, f, s3), advPass, advRecord)
-				advCheck(t, fmt.Sprintf("Affirmation %d: Swap %s, Swap, Rescind, Close", n, advDir(aIn)), advH(t, f, at(f.close(p4), p4)), advPass, advRecord)
-			}
+			s1, r1 := f.swap(p, 40_000, true)
+			s1 = at(s1, p)
+			s1.outs[0].script = lockOf(r1.after)
+			mustPass(t, advH(t, f, s1))
+			s2, r2 := f.swap(r1.after, 7_000, false)
+			s2 = at(s2, r1.after)
+			s2.outs[0].script = lockOf(r2.after)
+			mustPass(t, advH(t, f, s2))
+			s3, after := f.rescind(r2.after)
+			s3 = at(s3, r2.after)
+			s3.outs[0].script = lockOf(after)
+			mustPass(t, advH(t, f, s3))
+			mustPass(t, advH(t, f, at(f.close(after), after)))
+			// carried unchanged: a continuation with the fixture's affirmation is refused
+			bad := advCopy(s1)
+			bad.outs[0].script = f.poolLock(r1.after)
+			mustFailPool(t, advH(t, f, bad))
 		})
+	}
+	for _, w := range []int{0, 31, 33, 64} {
+		st := advStateOf(fresh())
+		st.affR = bytes.Repeat([]byte{0x72}, w)
+		_, err := f.advSDKScript(t, st)
+		t.Logf("ADV-RECORD %s | AffirmationR of %d bytes: the SDK builds it: %v", advToolchain(t), w, err == nil)
+		if advIsHead(t) && err == nil {
+			t.Errorf("Rúnar main's SDK built AffirmationR of %d bytes", w)
+		}
 	}
 }

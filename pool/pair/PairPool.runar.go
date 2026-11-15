@@ -34,7 +34,7 @@
 // the commissionPkh the relay names.
 //
 // The validator's and the LP's signatures must be SIGHASH_ALL|FORKID
-// (requireSighashAll; Pool leaves the type to the signer).
+// (requireSighashAll).
 //
 // The script can see no token input, in either direction. Every Swap needs
 // the validator's signature, and the validator is trusted to confirm the
@@ -43,30 +43,53 @@
 //
 // Methods, as Pool's: Swap, the validator's; Close, the LP's alone, outputs
 // free; Rescind, the validator's, writing the pair back with ValidatorPubKey
-// cleared. Nonce and Affirmation are carried unchanged, as Pool's.
+// cleared. The Nonce and the affirmation are carried unchanged, as Pool's.
 //
-// Compile with Rúnar v1 (main at 6bd5e29f4 or later) only. An older Rúnar
-// checks the _codePart witness's length as a lower bound, and a code part run
-// into the state then moves every state field: with a next key whose byte 16
-// is 0x6a the ValidatorIdentity key is read as LpPubKey and Closes the pair.
-// v1 checks the length exactly (the deployer writes it into the artifact's
-// codePartLenSlots; a pool deployed without that patch is unspendable).
+// The state is fixed-width, every field. The validator's affirmation is its
+// signature's r and s, 32 bytes each (AffirmationR, AffirmationS), not the
+// DER encoding Pool carries: a variable-length field is what makes Rúnar
+// patch the code's length into the script at deploy (a pool deployed without
+// the patch is unspendable), lets a deploy frame the field in a way the
+// writer does not (the continuation then no longer parses), and costs every
+// method a parser. With none of that, the template is the same in every
+// pool but for its constructor arguments.
 //
-// What the lookup must check when a pair is admitted, since the scripts
-// cannot: the pool at output 0 and the vault at output 1 of one transaction;
-// both prefixes equal to the reserves in state, the ids to AssetIdA and
-// AssetIdB, each 32 bytes and the two different; the vault's script the
-// canonical Vault and VaultCodeHash its sha256; the vault 1 sat (its sats
-// are not carried: any more leave through a Swap's change); the
-// Affirmation framed as Rúnar writes it (the shortest push for its length,
-// then exactly the rest of the script: the state reader also takes a longer
-// framing, the writer always writes the shortest, and poolScript relies on
-// the two lengths being equal). The vault checks only outpoints, never what
-// sits at output 0.
+// Compile with Rúnar v1 (main at 6bd5e29f4 or later): the tests assert that
+// compiler's script. It checks each fixed-width state field's size when a
+// continuation is written, and its SDK refuses to build a pool with a field
+// of the wrong width; an older Rúnar does neither.
 //
-// The deploy's builder must check the same two outputs before it broadcasts:
-// a pool deployed with anything but its vault at output 1 (a wallet's token
-// change put there, say) can never be spent, Close included.
+// What the scripts cannot check, and the lookup must when a pair is admitted:
+//
+//   - the pool at output 0 and the vault at output 1 of one transaction;
+//   - the pool's lock exactly prefix, code, OP_RETURN and the 251-byte
+//     state, each field at its width, nothing after it. The code is the
+//     canonical template with this pool's constructor arguments. Close reads
+//     the state as the script's last 251 bytes, so anything appended moves
+//     every field: 33 bytes of anything and Close obeys ValidatorPubKey, 66
+//     and it obeys ValidatorIdentity; a field of the wrong width and no
+//     method can spend the pair;
+//   - both prefixes equal to the reserves in state, the ids to AssetIdA and
+//     AssetIdB, each 32 bytes (the two different: Swap refuses a pair of one
+//     token), the reserves positive;
+//   - the vault's script the canonical Vault and VaultCodeHash its sha256;
+//   - the vault 1 sat (its sats are not carried: any more leave through a
+//     Swap's change), and the pool 1 sat (its sats are carried, and are the
+//     LP's again at Close);
+//   - LpPubKey and ValidatorPubKey public keys, the validator's the child of
+//     ValidatorIdentity the Nonce names, the affirmation its signature (as
+//     Pool's lookup does).
+//
+// And the validator, before it signs a Swap or a Rescind: the token inputs of
+// both tokens cover the token outputs; _changePKH is 20 bytes and the
+// transaction has no output past the contract's. (Rúnar does not check the
+// length of _changePKH, and a longer one carries further outputs behind the
+// change: icellan/runar#213. The contract cannot reach that argument.)
+//
+// The deploy's builder must check the pair's two outputs before it
+// broadcasts. Every method needs output 1 of the pool's transaction as input
+// 1: if a wallet put its token change there, the pool can be spent only
+// together with that output, and never once it is spent.
 package pair
 
 import runar "github.com/icellan/runar/packages/runar-go"
@@ -87,11 +110,17 @@ type PairPool struct {
 	LpFeeAPkh runar.Addr
 	LpFeeBPkh runar.Addr
 
-	Affirmation runar.ByteString
+	// The validator's affirmation of the pool: its signature's r and s,
+	// big-endian, 32 bytes each. State only so the compiler keeps them (as the
+	// Nonce); never assigned.
+	AffirmationR runar.Sha256Digest
+	AffirmationS runar.Sha256Digest
 
-	// The two tokens' canonical 32-byte BRC-162 ids.
-	AssetIdA runar.ByteString `runar:"readonly"`
-	AssetIdB runar.ByteString `runar:"readonly"`
+	// The two tokens' canonical 32-byte BRC-162 ids. Rúnar's fixed 32-byte
+	// type (as the Nonce): Rúnar v1's SDK refuses to build a pool with an id
+	// of any other length. No script checks it (the lookup does).
+	AssetIdA runar.Sha256Digest `runar:"readonly"`
+	AssetIdB runar.Sha256Digest `runar:"readonly"`
 	// VaultCodeHash is sha256 of the compiled Vault script, the same in every
 	// pool; Swap and Rescind take the script itself as an argument. The lookup
 	// checks it is the canonical one's.
@@ -115,8 +144,31 @@ type PairPool struct {
 func (c *PairPool) Swap(validatorSig runar.Sig, nextValidatorPubKey runar.PubKey, amountIn runar.Bigint, aIn runar.Bool, userPkh runar.Addr, commissionPkh runar.Addr, tokenChangePkh runar.Addr, tokenChange runar.Bigint, allPrevouts runar.ByteString, vaultCode runar.ByteString) {
 	runar.Assert(runar.CheckSig(validatorSig, c.ValidatorPubKey))
 	c.requireSighashAll(validatorSig)
+	c.requireSwappable()
+	// amountIn and the taker's change are BRC-162 amounts: at most 2^64-1.
+	// Every other amount in a prefix follows: a fee is at most amountIn, and
+	// the reserves and the payout are under 2^63 by the state's 8 bytes. The
+	// change is written as a minimal number below, whatever push the argument
+	// came in; the others are the script's own arithmetic, minimal by
+	// construction.
 	runar.Assert(amountIn > 0)
+	runar.Assert(amountIn <= 18446744073709551615)
 	runar.Assert(tokenChange >= 0)
+	runar.Assert(tokenChange <= 18446744073709551615)
+	change := runar.Bin2Num(runar.Num2Bin(tokenChange, 9))
+	// The next key is a compressed public key by its length and first byte:
+	// the cleared key of a rescinded pool is written by Rescind alone. (Rúnar
+	// v1 checks the 33 bytes itself when the state is written; an older Rúnar
+	// does not, and a key of another length there writes a continuation no
+	// method can spend.)
+	runar.Assert(runar.Len(nextValidatorPubKey) == 33)
+	keyType := runar.Substr(nextValidatorPubKey, 0, 1)
+	runar.Assert(keyType == runar.ByteString("\x02") || keyType == runar.ByteString("\x03"))
+	// Every address is 20 bytes: any other length makes the output it is
+	// written into a script that is not P2PKH.
+	runar.Assert(runar.Len(userPkh) == 20)
+	runar.Assert(runar.Len(commissionPkh) == 20)
+	runar.Assert(runar.Len(tokenChangePkh) == 20)
 	c.requireVault(allPrevouts, runar.ExtractHashPrevouts(c.TxPreimage), runar.ExtractOutpoint(c.TxPreimage))
 
 	// Read before writePair's GetStateScript (a state property read after it
@@ -163,7 +215,7 @@ func (c *PairPool) Swap(validatorSig runar.Sig, nextValidatorPubKey runar.PubKey
 	lpScript := c.tokenP2pkh(inAsset, lpFee, lpPkh)
 	validatorScript := c.tokenP2pkh(inAsset, validatorFee, validatorPkh)
 	commissionScript := c.tokenP2pkh(inAsset, commission, commissionPkh)
-	tokenChangeScript := c.tokenP2pkh(inAsset, tokenChange, tokenChangePkh)
+	tokenChangeScript := c.tokenP2pkh(inAsset, change, tokenChangePkh)
 	if lpFee > 0 {
 		c.AddRawOutput(1, lpScript)
 	}
@@ -173,14 +225,15 @@ func (c *PairPool) Swap(validatorSig runar.Sig, nextValidatorPubKey runar.PubKey
 	if commission > 0 {
 		c.AddRawOutput(1, commissionScript)
 	}
-	if tokenChange > 0 {
+	if change > 0 {
 		c.AddRawOutput(1, tokenChangeScript)
 	}
 }
 
 // Close ends the pool, the LP's alone: a signature by the LP key, the outputs
 // free. It requires the vault as input 1, so a Close that forgot the vault is
-// a rejected transaction, not a stranded reserve.
+// a rejected transaction, not a stranded reserve. (With a fixed-width state
+// Close takes no _codePart witness: Swap and Rescind do.)
 func (c *PairPool) Close(lpSig runar.Sig, allPrevouts runar.ByteString) {
 	c.requireSighashAll(lpSig)
 	c.requireVault(allPrevouts, runar.ExtractHashPrevouts(c.TxPreimage), runar.ExtractOutpoint(c.TxPreimage))
@@ -213,6 +266,19 @@ func (c *PairPool) requireVault(allPrevouts runar.ByteString, hashPrevouts runar
 	runar.Assert(runar.Substr(allPrevouts, 36, 36) == runar.Cat(txid, runar.ByteString("\x01\x00\x00\x00")))
 }
 
+// requireSwappable: what a deploy must have got right for a Swap to make
+// sense, checked in Swap alone so that a pool deployed wrong can still be
+// closed by its LP (and rescinded). The two tokens differ, and no fee rate is
+// negative (a negative rate is a negative fee: more than amountIn credited to
+// the pool, and no fee output). Rates summing to 100% or more need no check:
+// they leave no net, which Swap refuses.
+func (c *PairPool) requireSwappable() {
+	runar.Assert(c.AssetIdA != c.AssetIdB)
+	runar.Assert(c.LpFeeBps >= 0)
+	runar.Assert(c.ValidatorFeeBps >= 0)
+	runar.Assert(c.CommissionBps >= 0)
+}
+
 // requireSighashAll: the signer's signature is SIGHASH_ALL|FORKID. The
 // preimage is that type by Rúnar's own check, which pins this transaction's
 // outputs for the script; the signature's type decides what the signer has
@@ -238,9 +304,8 @@ func (c *PairPool) writePair(sats runar.Bigint, vaultCode runar.ByteString) {
 // prefix for ReserveA, this contract's code (from the preimage scriptCode),
 // and the state. Only ReserveA, ReserveB and ValidatorPubKey are ever
 // assigned and all three are fixed-width, so the new state is exactly as long
-// as the spent one, given the spent one's Affirmation is framed as Rúnar
-// writes it (the lookup's check). The varint is 1 or 3 bytes: a script under
-// 0x10000 bytes.
+// as the spent one. The varint is 1 or 3 bytes: the script is under 0x10000
+// bytes, having no field a deploy could make long.
 func (c *PairPool) poolScript() runar.ByteString {
 	prefix := c.tokenPrefix(c.AssetIdA, c.ReserveA)
 	state := c.GetStateScript()
@@ -259,13 +324,13 @@ func (c *PairPool) poolScript() runar.ByteString {
 }
 
 // tokenP2pkh is a BRC-162 value output of amount of assetId to pkh.
-func (c *PairPool) tokenP2pkh(assetId runar.ByteString, amount runar.Bigint, pkh runar.Addr) runar.ByteString {
+func (c *PairPool) tokenP2pkh(assetId runar.Sha256Digest, amount runar.Bigint, pkh runar.Addr) runar.ByteString {
 	return runar.Cat(c.tokenPrefix(assetId, amount), p2pkh(pkh))
 }
 
 // tokenPrefix is the BRC-162 value-output prefix push(assetId) push(amount)
 // OP_2DROP, no payload (as Pool's). Callers only output it for amount > 0.
-func (c *PairPool) tokenPrefix(assetId runar.ByteString, amount runar.Bigint) runar.ByteString {
+func (c *PairPool) tokenPrefix(assetId runar.Sha256Digest, amount runar.Bigint) runar.ByteString {
 	push := runar.Num2Bin(runar.Clamp(amount, 0, 16)+80, 1) // OP_1..OP_16
 	if amount > 16 {
 		amt := runar.Pack(amount)

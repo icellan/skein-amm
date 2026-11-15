@@ -2,7 +2,7 @@
 
 // On-node (bitcoin-sv regtest) tests of pool/pair/PairPool.runar.go and
 // pool/pair/Vault.runar.go, compiled from source at test time by whichever
-// Rúnar this module resolves (HEAD through go.local.mod, the skein-amm pin
+// Rúnar this module resolves (Rúnar main through go.local.mod, the skein-amm pin
 // through go.pinned.mod; see README.md).
 //
 // WHAT THIS PROVES: the compiled pool's and vault's locking and unlocking
@@ -177,7 +177,7 @@ func compilePair() (*compiledPair, error) {
 	for _, p := range c.tmpl.ABI.Constructor.Params {
 		params = append(params, p.Name)
 	}
-	if got, want := strings.Join(params, ","), "reserveA,reserveB,lpPubKey,validatorPubKey,validatorIdentity,nonce,lpFeeAPkh,lpFeeBPkh,affirmation,assetIdA,assetIdB,vaultCodeHash,lpFeeBps,validatorFeeBps,commissionBps"; got != want {
+	if got, want := strings.Join(params, ","), "reserveA,reserveB,lpPubKey,validatorPubKey,validatorIdentity,nonce,lpFeeAPkh,lpFeeBPkh,affirmationR,affirmationS,assetIdA,assetIdB,vaultCodeHash,lpFeeBps,validatorFeeBps,commissionBps"; got != want {
 		return nil, fmt.Errorf("pool constructor params changed: %s", got)
 	}
 	if got := publicMethods(c.tmpl); got != "swap,close,rescind" {
@@ -263,11 +263,20 @@ func scriptNum(n int64) []byte {
 	return b
 }
 
-// pushNum is a minimal push of a non-negative number.
+// pushNum is a minimal push of a number (negative ones only as deploy-time
+// fee rates).
 func pushNum(n int64) []byte {
 	switch {
+	case n == -1:
+		return []byte{0x4f}
 	case n < 0:
-		panic("negative push")
+		b := scriptNum(-n)
+		if b[len(b)-1]&0x80 != 0 {
+			b = append(b, 0x80)
+		} else {
+			b[len(b)-1] |= 0x80
+		}
+		return append([]byte{byte(len(b))}, b...)
 	case n == 0:
 		return []byte{0x00}
 	case n <= 16:
@@ -327,7 +336,8 @@ func tokenP2pkh(assetID []byte, amount int64, to []byte) []byte {
 type params struct {
 	lpBps, validatorBps, commissionBps int64
 	assetA, assetB, nonce              []byte
-	lpFeeAPkh, lpFeeBPkh, affirmation  []byte
+	lpFeeAPkh, lpFeeBPkh               []byte
+	affR, affS                         []byte // AffirmationR, AffirmationS: 32 bytes each
 	identity                           *ec.PrivateKey
 }
 
@@ -352,7 +362,7 @@ func (s pairState) validatorPub() []byte {
 
 // stateBytes is ReserveA (8 LE) || ReserveB (8 LE) || LpPubKey ||
 // ValidatorPubKey || ValidatorIdentity || Nonce || LpFeeAPkh || LpFeeBPkh ||
-// push(Affirmation).
+// AffirmationR || AffirmationS: fixed-width, 251 bytes.
 func stateBytes(p params, s pairState) []byte {
 	b := make([]byte, 16)
 	binary.LittleEndian.PutUint64(b, uint64(s.a))
@@ -363,8 +373,8 @@ func stateBytes(p params, s pairState) []byte {
 	b = append(b, p.nonce...)
 	b = append(b, p.lpFeeAPkh...)
 	b = append(b, p.lpFeeBPkh...)
-	b = append(b, byte(len(p.affirmation)))
-	return append(b, p.affirmation...)
+	b = append(b, p.affR...)
+	return append(b, p.affS...)
 }
 
 // poolScript is output 0: prefix(A, ReserveA) || code || OP_RETURN || state.
@@ -379,7 +389,7 @@ func vaultScript(p params, vault []byte, s pairState) []byte {
 	return append(tokenPrefix(p.assetB, s.b), vault...)
 }
 
-// sdkCode deploys through the Rúnar Go SDK (NewRunarContract with the 15
+// sdkCode deploys through the Rúnar Go SDK (NewRunarContract with the 16
 // constructor args + GetLockingScript, which builds code || OP_RETURN ||
 // state) and returns the code part, after checking the SDK's state section
 // equals stateBytes.
@@ -393,7 +403,8 @@ func sdkCode(t *testing.T, c *compiledPair, p params, s pairState) []byte {
 		hex.EncodeToString(p.nonce),
 		hex.EncodeToString(p.lpFeeAPkh),
 		hex.EncodeToString(p.lpFeeBPkh),
-		hex.EncodeToString(p.affirmation),
+		hex.EncodeToString(p.affR),
+		hex.EncodeToString(p.affS),
 		hex.EncodeToString(p.assetA),
 		hex.EncodeToString(p.assetB),
 		hex.EncodeToString(c.vaultHash),
@@ -412,37 +423,14 @@ func sdkCode(t *testing.T, c *compiledPair, p params, s pairState) []byte {
 
 // handCode builds the pool code from the artifact template WITHOUT the SDK:
 // each constructor slot's OP_0 placeholder replaced by the arg's push, each
-// codeSepIndex slot set to OP_1 (0x51). With patchLen, each codePartLenSlots
-// 4-byte field (template offsets, shifted by the growth of the splices before
-// it) is overwritten with the deployed code length, little-endian; without it
-// they stay as the template has them.
-func handCode(t *testing.T, c *compiledPair, p params, patchLen bool) []byte {
+// codeSepIndex slot (an older Rúnar's) set to OP_1 (0x51). A fixed-width
+// state gives the artifact no codePartLenSlots; one that has them cannot be
+// built by a splice alone, and the suite refuses it.
+func handCode(t *testing.T, c *compiledPair, p params) []byte {
 	t.Helper()
-	code, fields := spliceTemplate(t, c, p)
-	if patchLen {
-		for _, at := range fields {
-			binary.LittleEndian.PutUint32(code[at:], uint32(len(code)))
-		}
+	if len(c.tmpl.CodePartLenSlots) != 0 {
+		t.Fatalf("the artifact has codePartLenSlots %+v: the deployed code is no longer the template with its constructor args", c.tmpl.CodePartLenSlots)
 	}
-	return code
-}
-
-// templateLenPins returns the offsets of the verify_code_part_len fields in
-// the hand-spliced code and the lengths the template leaves in them.
-func templateLenPins(t *testing.T, c *compiledPair, p params) (offs []int, pins []int) {
-	t.Helper()
-	code, fields := spliceTemplate(t, c, p)
-	for _, at := range fields {
-		offs = append(offs, at)
-		pins = append(pins, int(binary.LittleEndian.Uint32(code[at:])))
-	}
-	return offs, pins
-}
-
-// spliceTemplate is handCode without the length patch, plus the offsets (in
-// the spliced code) of the codePartLenSlots fields.
-func spliceTemplate(t *testing.T, c *compiledPair, p params) ([]byte, []int) {
-	t.Helper()
 	type sub struct {
 		off int
 		b   []byte
@@ -451,20 +439,20 @@ func spliceTemplate(t *testing.T, c *compiledPair, p params) ([]byte, []int) {
 	for _, s := range c.tmpl.ConstructorSlots {
 		var b []byte
 		switch s.ParamIndex {
-		case 9:
-			b = pushData(p.assetA)
 		case 10:
-			b = pushData(p.assetB)
+			b = pushData(p.assetA)
 		case 11:
-			b = pushData(c.vaultHash)
+			b = pushData(p.assetB)
 		case 12:
-			b = pushNum(p.lpBps)
+			b = pushData(c.vaultHash)
 		case 13:
-			b = pushNum(p.validatorBps)
+			b = pushNum(p.lpBps)
 		case 14:
+			b = pushNum(p.validatorBps)
+		case 15:
 			b = pushNum(p.commissionBps)
 		default:
-			t.Fatalf("constructor slot for param %d: only the readonly args (9..14) are expected in the code", s.ParamIndex)
+			t.Fatalf("constructor slot for param %d: only the readonly args (10..15) are expected in the code", s.ParamIndex)
 		}
 		subs = append(subs, sub{s.ByteOffset, b})
 	}
@@ -485,28 +473,7 @@ func spliceTemplate(t *testing.T, c *compiledPair, p params) ([]byte, []int) {
 		code = append(code, s.b...)
 		pos = s.off + 1
 	}
-	code = append(code, c.raw[pos:]...)
-	var fields []int
-	for _, slot := range c.tmpl.CodePartLenSlots {
-		at := slot.ByteOffset // a template offset: shift it by the growth of the splices before it
-		for _, s := range subs {
-			if s.off < slot.ByteOffset {
-				at += len(s.b) - 1
-			}
-		}
-		checkLenField(t, code, at)
-		fields = append(fields, at)
-	}
-	return code, fields
-}
-
-// checkLenField asserts code[at-1:at+7] is `04 LL LL LL LL 81 9c 69`
-// (push4 <len> OP_BIN2NUM OP_NUMEQUAL OP_VERIFY): verify_code_part_len.
-func checkLenField(t *testing.T, code []byte, at int) {
-	t.Helper()
-	if at < 1 || at+7 > len(code) || code[at-1] != 0x04 || !bytes.Equal(code[at+4:at+7], []byte{0x81, 0x9c, 0x69}) {
-		t.Fatalf("offset %d is not a verify_code_part_len field: %x", at, code[max(0, at-1):min(len(code), at+7)])
-	}
+	return append(code, c.raw[pos:]...)
 }
 
 // scriptCodeAfter is a contract lock's BIP-143 scriptCode: what follows its
@@ -550,26 +517,20 @@ func randBytes(t *testing.T, n int) []byte {
 	return b
 }
 
-// affirmationOf is a stand-in DER-shaped affirmation of n bytes (the contract
-// never checks it; only its length shapes the state).
-func affirmationOf(n int) []byte {
-	if n == 0 {
-		return []byte{}
-	}
-	a := append([]byte{0x30, byte(n - 2)}, bytes.Repeat([]byte{0x02}, n)...)
-	return a[:n]
-}
-
-func newParams(t *testing.T, lpBps, validatorBps, commissionBps int64, affLen int) params {
+// newParams is a pair's deploy parameters with fresh ids and keys. The
+// affirmation's r and s are random 32-byte stand-ins (the contract never
+// checks them; TestRealAffirmation uses a real signature's).
+func newParams(t *testing.T, lpBps, validatorBps, commissionBps int64) params {
 	return params{
 		lpBps: lpBps, validatorBps: validatorBps, commissionBps: commissionBps,
-		assetA:      randBytes(t, 32),
-		assetB:      randBytes(t, 32),
-		nonce:       randBytes(t, 32),
-		lpFeeAPkh:   pkh(newKey(t)),
-		lpFeeBPkh:   pkh(newKey(t)),
-		affirmation: affirmationOf(affLen),
-		identity:    newKey(t),
+		assetA:    randBytes(t, 32),
+		assetB:    randBytes(t, 32),
+		nonce:     randBytes(t, 32),
+		lpFeeAPkh: pkh(newKey(t)),
+		lpFeeBPkh: pkh(newKey(t)),
+		affR:      randBytes(t, 32),
+		affS:      randBytes(t, 32),
+		identity:  newKey(t),
 	}
 }
 
@@ -814,7 +775,7 @@ func (e *env) deploySDK(p params, st pairState) *pair {
 	t.Helper()
 	c := compiled(t)
 	code := sdkCode(t, c, p, st)
-	if hc := handCode(t, c, p, true); !bytes.Equal(hc, code) {
+	if hc := handCode(t, c, p); !bytes.Equal(hc, code) {
 		t.Fatalf("independently built code (%d bytes) differs from the SDK's (%d bytes)", len(hc), len(code))
 	}
 	return e.deployCode(p, st, code, "deploy")
@@ -856,7 +817,7 @@ type input struct {
 	coin *coin // kindCoin
 	pr   *pair // kindPool, kindVault
 
-	// The pool's unlocking: _codePart, sig, args, allPrevouts, [vaultCode,
+	// The pool's unlocking: [_codePart] (not Close), sig, args, allPrevouts, [vaultCode,
 	// _changePKH, _changeAmount] (not Close), txPreimage (always ALL|FORKID,
 	// Rúnar's own check), method index.
 	method     int
@@ -867,7 +828,10 @@ type input struct {
 	changePkh  []byte       // Rúnar change; nil: none (zero PKH, amount 0)
 	changeSats int64
 	codePart   []byte // nil: the pair's code
-	prevouts   []byte // allPrevouts (pool or vault); nil: the transaction's own
+	// strayCodePart: a Close that pushes a _codePart first anyway, as Close
+	// did while the state had a variable-length field.
+	strayCodePart bool
+	prevouts      []byte // allPrevouts (pool or vault); nil: the transaction's own
 
 	// The vault's unlocking: allPrevouts, txPreimage under flag (0: ALL|FORKID).
 	flag sighash.Flag
@@ -1001,11 +965,16 @@ func (e *env) build(s *spend, fee int64) built {
 			if !sig.Verify(digest[:], in.signer.PubKey()) {
 				t.Fatalf("%s: the pool input's signature does not verify over its own sighash type's digest", s.label)
 			}
-			codePart := in.codePart
-			if codePart == nil {
-				codePart = in.pr.code
+			// _codePart: Swap and Rescind, which write a continuation; Close
+			// takes none (strayCodePart pushes one anyway).
+			var u []byte
+			if in.method != methodClose || in.strayCodePart {
+				codePart := in.codePart
+				if codePart == nil {
+					codePart = in.pr.code
+				}
+				u = pushData(codePart)
 			}
-			u := pushData(codePart)
 			u = append(u, pushData(append(sig.Serialize(), byte(sigFlag)))...)
 			for _, a := range in.args {
 				u = append(u, a...)
@@ -1237,10 +1206,12 @@ type swapPlan struct {
 	satsChange                    int64
 }
 
+// ceilFee is the contract's fee, (amountIn*bps + 9999) / 10000, the division
+// truncating toward zero as OP_DIV does (it matters for a negative rate).
 func ceilFee(amountIn, bps int64) int64 {
 	x := new(big.Int).Mul(big.NewInt(amountIn), big.NewInt(bps))
 	x.Add(x, big.NewInt(9999))
-	return x.Div(x, big.NewInt(10000)).Int64()
+	return x.Quo(x, big.NewInt(10000)).Int64()
 }
 
 func planSwap(t *testing.T, pr *pair, amountIn int64, aIn bool) *swapPlan {
@@ -1377,10 +1348,16 @@ func (e *env) swap(pr *pair, r *swapPlan) string {
 }
 
 func (e *env) swapWith(pr *pair, r *swapPlan, s *spend) string {
+	txid, _ := e.swapWithTx(pr, r, s)
+	return txid
+}
+
+// swapWithTx is swapWith also returning the mined transaction.
+func (e *env) swapWithTx(pr *pair, r *swapPlan, s *spend) (string, *transaction.Transaction) {
 	txid, got, b := e.accept(s)
 	e.checkPairCarried(pr, s, got, b)
 	pr.txid, pr.st, pr.poolLock, pr.vaultLock = txid, r.after, s.outs[0].script, s.outs[1].script
-	return txid
+	return txid, got
 }
 
 // rescindSpend is the validator's honest Rescind: the pool and vault written
