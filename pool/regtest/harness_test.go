@@ -1,15 +1,17 @@
 //go:build integration
 
 // On-node (bitcoin-sv regtest) tests of pool/Pool.runar.go, compiled from
-// source at test time by whichever Rúnar this module resolves (HEAD through
-// go.local.mod, the skein-amm pin through go.pinned.mod; see README.md).
+// source at test time by whichever Rúnar this module resolves (the checkout
+// through go.local.mod, the skein-amm pin through go.pinned.mod; see
+// README.md).
 //
 // WHAT THIS PROVES: the compiled pool's locking and unlocking scripts are
 // valid under a real node's consensus rules and its standardness policy (as
 // configured by Rúnar's integration/regtest.sh), every spend's outputs are the
 // ones the contract computes (byte for byte, re-read from the mined chain),
 // and the satoshi value flow of each spend (who pays the miner, what enters
-// and leaves the pool). Negative cases show the node itself refuses them.
+// and leaves the pool). Negative cases show the node itself refuses them, and
+// the go-sdk interpreter names the input and the opcodes it stopped at.
 //
 // WHAT THIS DOES NOT PROVE: token conservation. The node knows nothing about
 // BRC-162: a "token output" is just a script with a
@@ -38,6 +40,7 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	crypto "github.com/bsv-blockchain/go-sdk/primitives/hash"
 	"github.com/bsv-blockchain/go-sdk/script"
 	"github.com/bsv-blockchain/go-sdk/script/interpreter"
 	"github.com/bsv-blockchain/go-sdk/transaction"
@@ -54,6 +57,18 @@ const (
 	methodSwap = iota
 	methodClose
 	methodRescind
+)
+
+// Swap's declared args before allPrevouts, by index in spend.args.
+const (
+	argSig = iota
+	argNextKey
+	argAmountIn
+	argBsvIn
+	argUserPkh
+	argCommissionPkh
+	argTokenChangePkh
+	argTokenChange
 )
 
 // feeRate is what every spend in this suite pays the miner, in sat/kB.
@@ -73,9 +88,9 @@ var feeRate = func() int64 {
 // The compiled contract
 // ---------------------------------------------------------------------------
 
-// template is the artifact fields the hand splice reads, parsed from the
-// artifact JSON (not runar.RunarArtifact, so the pinned Rúnar's SDK, which may
-// predate a field, builds the same suite).
+// template is the artifact fields the independent build reads, parsed from
+// the artifact JSON (not runar.RunarArtifact, so the pinned Rúnar's SDK, which
+// may predate a field, builds the same suite).
 type template struct {
 	Script            string
 	ConstructorSlots  []struct{ ParamIndex, ByteOffset int }
@@ -149,7 +164,7 @@ func compilePool() (*compiledPool, error) {
 			methods = append(methods, m.Name)
 		}
 	}
-	if got, want := strings.Join(params, ","), "tokenReserve,lpPubKey,validatorPubKey,validatorIdentity,nonce,lpSatsPkh,lpTokenPkh,affirmation,assetId,lpFeeBps,validatorFeeBps,commissionBps"; got != want {
+	if got, want := strings.Join(params, ","), "tokenReserve,lpPubKey,validatorPubKey,validatorIdentity,nonce,lpSatsPkh,lpTokenPkh,affirmationR,affirmationS,assetId,lpFeeBps,validatorFeeBps,commissionBps"; got != want {
 		return nil, fmt.Errorf("constructor params changed: %s", got)
 	}
 	if got := strings.Join(methods, ","); got != "swap,close,rescind" {
@@ -174,9 +189,11 @@ func scriptNum(n int64) []byte {
 	return b
 }
 
-// pushNum is a minimal push of a non-negative number.
+// pushNum is a minimal push of a number.
 func pushNum(n int64) []byte {
 	switch {
+	case n == -1:
+		return []byte{0x4f}
 	case n < 0:
 		b := scriptNum(-n)
 		if b[len(b)-1]&0x80 != 0 {
@@ -223,17 +240,23 @@ func pushBool(v bool) []byte {
 	return []byte{0x00}
 }
 
-func p2pkhScript(pkh []byte) []byte {
-	return append(append([]byte{0x76, 0xa9, 0x14}, pkh...), 0x88, 0xac)
+// p2pkhScript is 76 a9 14 <h> 88 ac, whatever h's length (as the contract's
+// p2pkh, which writes the 0x14 regardless).
+func p2pkhScript(h []byte) []byte {
+	return append(append([]byte{0x76, 0xa9, 0x14}, h...), 0x88, 0xac)
 }
 
 func pkh(k *ec.PrivateKey) []byte { return k.PubKey().Hash() }
 
 // tokenPrefix is the BRC-162 value-output prefix with no payload.
 func tokenPrefix(assetID []byte, amount int64) []byte {
+	return tokenPrefixPush(assetID, pushNum(amount))
+}
+
+// tokenPrefixPush is a token prefix with a raw amount push.
+func tokenPrefixPush(assetID, push []byte) []byte {
 	p := append([]byte{0x20}, assetID...)
-	p = append(p, pushNum(amount)...)
-	return append(p, 0x6d)
+	return append(append(p, push...), 0x6d)
 }
 
 func tokenP2pkh(assetID []byte, amount int64, to []byte) []byte {
@@ -242,9 +265,9 @@ func tokenP2pkh(assetID []byte, amount int64, to []byte) []byte {
 
 // params is what a pool is deployed with and carries for its life.
 type params struct {
-	lpBps, validatorBps, commissionBps                 int64
-	assetID, nonce, lpSatsPkh, lpTokenPkh, affirmation []byte
-	identity                                           *ec.PrivateKey
+	lpBps, validatorBps, commissionBps                      int64
+	assetID, nonce, lpSatsPkh, lpTokenPkh, affirmR, affirmS []byte
+	identity                                                *ec.PrivateKey
 }
 
 // poolState is what changes across spends.
@@ -266,8 +289,9 @@ func (s poolState) validatorPub() []byte {
 }
 
 // stateBytes is TokenReserve (8 LE) || LpPubKey || ValidatorPubKey ||
-// ValidatorIdentity || Nonce || LpSatsPkh || LpTokenPkh || len(Affirmation)
-// || Affirmation.
+// ValidatorIdentity (33 each) || Nonce (32) || LpSatsPkh || LpTokenPkh (20
+// each) || AffirmationR || AffirmationS (32 each): 243 bytes, every field
+// fixed-width.
 func stateBytes(p params, s poolState) []byte {
 	b := make([]byte, 8)
 	binary.LittleEndian.PutUint64(b, uint64(s.tokens))
@@ -277,8 +301,8 @@ func stateBytes(p params, s poolState) []byte {
 	b = append(b, p.nonce...)
 	b = append(b, p.lpSatsPkh...)
 	b = append(b, p.lpTokenPkh...)
-	b = append(b, byte(len(p.affirmation)))
-	return append(b, p.affirmation...)
+	b = append(b, p.affirmR...)
+	return append(b, p.affirmS...)
 }
 
 // poolScript is the on-chain locking script: prefix || code || OP_RETURN || state.
@@ -301,7 +325,8 @@ func sdkCode(t *testing.T, c *compiledPool, p params, s poolState) []byte {
 		hex.EncodeToString(p.nonce),
 		hex.EncodeToString(p.lpSatsPkh),
 		hex.EncodeToString(p.lpTokenPkh),
-		hex.EncodeToString(p.affirmation),
+		hex.EncodeToString(p.affirmR),
+		hex.EncodeToString(p.affirmS),
 		hex.EncodeToString(p.assetID),
 		p.lpBps, p.validatorBps, p.commissionBps,
 	})
@@ -317,38 +342,15 @@ func sdkCode(t *testing.T, c *compiledPool, p params, s poolState) []byte {
 }
 
 // handCode builds the pool code from the artifact template WITHOUT the SDK:
-// each constructor slot's OP_0 placeholder replaced by the arg's push, each
-// codeSepIndex slot set to OP_1 (0x51), as src/pool.zig and gen/vectors do.
-// With patchLen, each codePartLenSlots 4-byte field (template offsets, shifted
-// by the growth of the splices before it) is overwritten with the deployed
-// code length, little-endian; without it they stay as the template has them.
-func handCode(t *testing.T, c *compiledPool, p params, patchLen bool) []byte {
+// each constructor slot's OP_0 placeholder replaced by the arg's minimal push.
+// The fixed-width state leaves the artifact no codeSepIndexSlots and no
+// codePartLenSlots; if a compiler emits either, the template is no longer
+// constructor slots alone and this fails, naming them.
+func handCode(t *testing.T, c *compiledPool, p params) []byte {
 	t.Helper()
-	code, fields := spliceTemplate(t, c, p)
-	if patchLen {
-		for _, at := range fields {
-			binary.LittleEndian.PutUint32(code[at:], uint32(len(code)))
-		}
+	if n, m := len(c.tmpl.CodeSepIndexSlots), len(c.tmpl.CodePartLenSlots); n != 0 || m != 0 {
+		t.Fatalf("the artifact has %d codeSepIndexSlots and %d codePartLenSlots: a template splice of the constructor slots alone is not the deployed code", n, m)
 	}
-	return code
-}
-
-// templateLenPins returns the offsets of the verify_code_part_len fields in
-// the hand-spliced code and the lengths the template leaves in them.
-func templateLenPins(t *testing.T, c *compiledPool, p params) (offs []int, pins []int) {
-	t.Helper()
-	code, fields := spliceTemplate(t, c, p)
-	for _, at := range fields {
-		offs = append(offs, at)
-		pins = append(pins, int(binary.LittleEndian.Uint32(code[at:])))
-	}
-	return offs, pins
-}
-
-// spliceTemplate is handCode without the length patch, plus the offsets (in
-// the spliced code) of the codePartLenSlots fields.
-func spliceTemplate(t *testing.T, c *compiledPool, p params) ([]byte, []int) {
-	t.Helper()
 	type sub struct {
 		off int
 		b   []byte
@@ -357,24 +359,18 @@ func spliceTemplate(t *testing.T, c *compiledPool, p params) ([]byte, []int) {
 	for _, s := range c.tmpl.ConstructorSlots {
 		var b []byte
 		switch s.ParamIndex {
-		case 8:
-			b = pushData(p.assetID)
 		case 9:
-			b = pushNum(p.lpBps)
+			b = pushData(p.assetID)
 		case 10:
-			b = pushNum(p.validatorBps)
+			b = pushNum(p.lpBps)
 		case 11:
+			b = pushNum(p.validatorBps)
+		case 12:
 			b = pushNum(p.commissionBps)
 		default:
-			t.Fatalf("constructor slot for param %d: only the readonly args (8..11) are expected in the code", s.ParamIndex)
+			t.Fatalf("constructor slot for param %d: only the readonly args (9..12) are expected in the code", s.ParamIndex)
 		}
 		subs = append(subs, sub{s.ByteOffset, b})
-	}
-	for _, s := range c.tmpl.CodeSepIndexSlots {
-		if s.CodeSepIndex != 1 {
-			t.Fatalf("codeSepIndex slot %+v: the separator is not at byte 1", s)
-		}
-		subs = append(subs, sub{s.ByteOffset, []byte{0x51}})
 	}
 	sort.Slice(subs, func(i, j int) bool { return subs[i].off < subs[j].off })
 	var code []byte
@@ -387,28 +383,7 @@ func spliceTemplate(t *testing.T, c *compiledPool, p params) ([]byte, []int) {
 		code = append(code, s.b...)
 		pos = s.off + 1
 	}
-	code = append(code, c.raw[pos:]...)
-	var fields []int
-	for _, slot := range c.tmpl.CodePartLenSlots {
-		at := slot.ByteOffset // a template offset: shift it by the growth of the splices before it
-		for _, s := range subs {
-			if s.off < slot.ByteOffset {
-				at += len(s.b) - 1
-			}
-		}
-		checkLenField(t, code, at)
-		fields = append(fields, at)
-	}
-	return code, fields
-}
-
-// checkLenField asserts code[at-1:at+7] is `04 LL LL LL LL 81 9c 69`
-// (push4 <len> OP_BIN2NUM OP_NUMEQUAL OP_VERIFY): verify_code_part_len.
-func checkLenField(t *testing.T, code []byte, at int) {
-	t.Helper()
-	if at < 1 || at+7 > len(code) || code[at-1] != 0x04 || !bytes.Equal(code[at+4:at+7], []byte{0x81, 0x9c, 0x69}) {
-		t.Fatalf("offset %d is not a verify_code_part_len field: %x", at, code[max(0, at-1):min(len(code), at+7)])
-	}
+	return append(code, c.raw[pos:]...)
 }
 
 // separatorScriptCode is the locking script after the pool's OP_CODESEPARATOR
@@ -451,26 +426,26 @@ func randBytes(t *testing.T, n int) []byte {
 	return b
 }
 
-// affirmationOf is a stand-in DER-shaped affirmation of n bytes (the contract
-// never checks it; only its length shapes the state).
-func affirmationOf(n int) []byte {
-	if n == 0 {
-		return []byte{}
-	}
-	a := append([]byte{0x30, byte(n - 2)}, bytes.Repeat([]byte{0x02}, n-2)...)
-	return a[:n]
-}
-
-func newParams(t *testing.T, lpBps, validatorBps, commissionBps int64, affLen int) params {
+// newParams is a pool's deploy-time values; the affirmation is 64 random
+// bytes as r and s (the contract never checks it; TestAffirmationCarried
+// uses a real signature).
+func newParams(t *testing.T, lpBps, validatorBps, commissionBps int64) params {
 	return params{
 		lpBps: lpBps, validatorBps: validatorBps, commissionBps: commissionBps,
-		assetID:     randBytes(t, 32),
-		nonce:       randBytes(t, 32),
-		lpSatsPkh:   pkh(newKey(t)),
-		lpTokenPkh:  pkh(newKey(t)),
-		affirmation: affirmationOf(affLen),
-		identity:    newKey(t),
+		assetID:    randBytes(t, 32),
+		nonce:      randBytes(t, 32),
+		lpSatsPkh:  pkh(newKey(t)),
+		lpTokenPkh: pkh(newKey(t)),
+		affirmR:    randBytes(t, 32),
+		affirmS:    randBytes(t, 32),
+		identity:   newKey(t),
 	}
+}
+
+// newPoolState is a fresh pool's state: 1,000,000 sats against 5,000,000
+// tokens (realistic magnitudes: the swap products exceed 4-byte numbers).
+func newPoolState(t *testing.T) poolState {
+	return poolState{bsv: 1_000_000, tokens: 5_000_000, lp: newKey(t), validator: newKey(t)}
 }
 
 // ---------------------------------------------------------------------------
@@ -478,12 +453,11 @@ func newParams(t *testing.T, lpBps, validatorBps, commissionBps int64, affLen in
 // ---------------------------------------------------------------------------
 
 type txStat struct {
-	test, label  string
-	size, fee    int64
-	unlockLen    int
-	accepted     bool
-	reason       string
-	poolInputIdx int
+	test, label string
+	size, fee   int64
+	unlockLen   int
+	accepted    bool
+	reason      string
 }
 
 var report struct {
@@ -680,19 +654,23 @@ type pool struct {
 	p    params
 	code []byte // deployed code: prologue .. last code byte, readonly args in
 	st   poolState
-	txid string // current UTXO (vout 0)
+	txid string // current UTXO
 	vout int
 	lock []byte // its locking script as on chain
 }
 
+func (p *pool) coin() *coin {
+	return &coin{txid: p.txid, vout: p.vout, sats: p.st.bsv, lock: p.lock}
+}
+
 // deploySDK deploys a pool whose code the Rúnar SDK built, after checking it
-// equals the independent hand-built-and-patched code.
+// equals the independent build from the template.
 func (e *env) deploySDK(p params, st poolState) *pool {
 	t := e.t
 	t.Helper()
 	c := compiled(t)
 	code := sdkCode(t, c, p, st)
-	if hc := handCode(t, c, p, true); !bytes.Equal(hc, code) {
+	if hc := handCode(t, c, p); !bytes.Equal(hc, code) {
 		t.Fatalf("independently built code (%d bytes) differs from the SDK's (%d bytes)", len(hc), len(code))
 	}
 	return e.deployCode(p, st, code, "deploy")
@@ -715,40 +693,67 @@ func (e *env) deployCode(p params, st poolState, code []byte, label string) *poo
 	return &pool{p: p, code: code, st: st, txid: txid, vout: 0, lock: lock}
 }
 
-// spend is one transaction spending a pool.
+// spend is one transaction spending one pool (or, for the twin-pool cases,
+// several byte-identical pools with the same unlocking arguments).
 type spend struct {
 	label     string
 	method    int
 	pool      *pool
 	poolIndex int
-	// others are the non-pool inputs in order (the pool is inserted at
-	// poolIndex). Unminted coins are minted by the funder first; the LAST
-	// unminted coin (when payer is set) is the fee payer: its value is set to
-	// exactly what the outputs need beyond every other input, plus the fee.
+	// twins are further pool inputs placed right after pool, each unlocked
+	// with the same method, args, signer and change as pool.
+	twins []*pool
+	// others are the non-pool inputs in order (the pools are inserted at
+	// poolIndex). Unminted coins are minted by the funder first; payer (one of
+	// them) is set to exactly what the outputs need beyond every other input,
+	// plus the fee.
 	others []*coin
 	payer  *coin
 	outs   []out
 	// feeFromOut >= 0 takes the fee from that output instead (no payer).
 	feeFromOut int
-	args       [][]byte // ABI args before the implicit ones; args[0] is the signature
-	signer     *ec.PrivateKey
+	// args are the declared args before allPrevouts (Swap and Rescind) or the
+	// preimage (Close); args[0] is the signature slot.
+	args   [][]byte
+	signer *ec.PrivateKey
+	// sigFlag is the signer's sighash type: it signs that type's digest and
+	// appends that byte. 0: ALL|FORKID.
+	sigFlag sighash.Flag
+	// prevouts is allPrevouts (Swap, Rescind); nil: the transaction's real
+	// input outpoints.
+	prevouts   []byte
 	changePkh  []byte // Rúnar change (_changePKH, _changeAmount); nil: none
 	changeSats int64
-	codePart   []byte // _codePart; defaults to the pool's code
 }
 
-// fee bookkeeping of a built spend.
+func (s *spend) pools() []*pool { return append([]*pool{s.pool}, s.twins...) }
+
 type built struct {
 	tx        *transaction.Transaction
 	outs      []out // the outputs as built (fee taken)
 	fee       int64
-	unlockLen int
+	unlockLen int   // the first pool input's unlocking script
+	poolIdx   []int // the pool inputs' indices
+}
+
+// preimage is the BIP-143 preimage of input idx with the given scriptCode.
+func preimage(t *testing.T, tx *transaction.Transaction, idx int, sats int64, scriptCode []byte, flag sighash.Flag) []byte {
+	t.Helper()
+	cp := tx.ShallowClone()
+	in := tx.Inputs[idx]
+	cp.Inputs[idx] = &transaction.TransactionInput{SourceTXID: in.SourceTXID, SourceTxOutIndex: in.SourceTxOutIndex, SequenceNumber: in.SequenceNumber}
+	cp.Inputs[idx].SetSourceTxOutput(&transaction.TransactionOutput{Satoshis: uint64(sats), LockingScript: script.NewFromBytes(scriptCode)})
+	pre, err := cp.CalcInputPreimage(uint32(idx), flag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pre
 }
 
 func (e *env) build(s *spend, fee int64) built {
 	t := e.t
 	t.Helper()
-	var outsTotal, othersFixed int64
+	var outsTotal, fixed int64
 	outs := append([]out{}, s.outs...)
 	if s.feeFromOut >= 0 {
 		outs[s.feeFromOut].sats -= fee
@@ -756,91 +761,146 @@ func (e *env) build(s *spend, fee int64) built {
 	for _, o := range outs {
 		outsTotal += o.sats
 	}
+	for _, p := range s.pools() {
+		fixed += p.st.bsv
+	}
 	for _, c := range s.others {
 		if c != s.payer {
-			othersFixed += c.sats
+			fixed += c.sats
 		}
 	}
-	if s.payer != nil {
-		s.payer.sats = outsTotal - s.pool.st.bsv - othersFixed + fee
+	switch {
+	case s.payer != nil && s.payer.txid == "":
+		s.payer.sats = outsTotal - fixed + fee
 		if fee > 0 && s.payer.sats < 1 { // a fee-0 draft may hold 0
 			t.Fatalf("%s: payer would hold %d sats", s.label, s.payer.sats)
 		}
+	case s.payer != nil: // minted already: its value fixes the fee
+		fee = s.payer.sats + fixed - outsTotal
 	}
 
 	tx := transaction.NewTransaction()
-	poolCoin := &coin{txid: s.pool.txid, vout: s.pool.vout, sats: s.pool.st.bsv, lock: s.pool.lock}
-	ins := append([]*coin{}, s.others...)
-	ins = append(ins[:s.poolIndex], append([]*coin{poolCoin}, ins[s.poolIndex:]...)...)
+	ins := append([]*coin{}, s.others[:s.poolIndex]...)
+	var poolIdx []int
+	for _, p := range s.pools() {
+		poolIdx = append(poolIdx, len(ins))
+		ins = append(ins, p.coin())
+	}
+	ins = append(ins, s.others[s.poolIndex:]...)
 	for _, c := range ins {
 		addInput(t, tx, c)
 	}
 	for _, o := range outs {
 		addOutput(tx, o)
 	}
-
-	// The preimage: BIP-143 over the scriptCode after the pool's separator.
-	pi := s.poolIndex
-	cp := tx.ShallowClone()
-	cp.Inputs[pi] = &transaction.TransactionInput{SourceTXID: tx.Inputs[pi].SourceTXID, SourceTxOutIndex: tx.Inputs[pi].SourceTxOutIndex, SequenceNumber: tx.Inputs[pi].SequenceNumber}
-	cp.Inputs[pi].SetSourceTxOutput(&transaction.TransactionOutput{Satoshis: uint64(s.pool.st.bsv), LockingScript: script.NewFromBytes(separatorScriptCode(t, s.pool.lock))})
-	pre, err := cp.CalcInputPreimage(uint32(pi), sighash.AllForkID)
-	if err != nil {
-		t.Fatal(err)
+	var real []byte
+	for _, in := range tx.Inputs {
+		real = append(real, in.SourceTXID.CloneBytes()...)
+		real = binary.LittleEndian.AppendUint32(real, in.SourceTxOutIndex)
 	}
-	h1 := sha256.Sum256(pre)
-	digest := sha256.Sum256(h1[:])
-	sig, err := s.signer.Sign(digest[:])
-	if err != nil {
-		t.Fatal(err)
+	prevouts := s.prevouts
+	if prevouts == nil {
+		prevouts = real
+	}
+	sigFlag := s.sigFlag
+	if sigFlag == 0 {
+		sigFlag = sighash.AllForkID
 	}
 
-	codePart := s.codePart
-	if codePart == nil {
-		codePart = s.pool.code
-	}
-	u := pushData(codePart)
-	u = append(u, pushData(append(sig.Serialize(), 0x41))...)
-	for _, a := range s.args[1:] {
-		u = append(u, a...)
-	}
-	if s.method != methodClose { // Close adds no output: no change parameters
-		chPkh, chSats := make([]byte, 20), int64(0)
-		if s.changePkh != nil {
-			chPkh, chSats = s.changePkh, s.changeSats
+	var unlockLen int
+	for j, p := range s.pools() {
+		i := poolIdx[j]
+		sc := separatorScriptCode(t, p.lock)
+		pre := preimage(t, tx, i, p.st.bsv, sc, sighash.AllForkID) // the txPreimage: Rúnar requires ALL|FORKID
+		h1 := sha256.Sum256(preimage(t, tx, i, p.st.bsv, sc, sigFlag))
+		digest := sha256.Sum256(h1[:])
+		sig, err := s.signer.Sign(digest[:])
+		if err != nil {
+			t.Fatal(err)
 		}
-		u = append(u, pushData(chPkh)...)
-		u = append(u, pushNum(chSats)...)
+		var u []byte
+		if s.method != methodClose { // _codePart: the methods that write a continuation
+			u = append(u, pushData(p.code)...)
+		}
+		u = append(u, pushData(append(sig.Serialize(), byte(sigFlag)))...)
+		for _, a := range s.args[1:] {
+			u = append(u, a...)
+		}
+		if s.method != methodClose { // allPrevouts and Rúnar's change params
+			u = append(u, pushData(prevouts)...)
+			chPkh, chSats := make([]byte, 20), int64(0)
+			if s.changePkh != nil {
+				chPkh, chSats = s.changePkh, s.changeSats
+			}
+			u = append(u, pushData(chPkh)...)
+			u = append(u, pushNum(chSats)...)
+		}
+		u = append(u, pushData(pre)...)
+		u = append(u, pushNum(int64(s.method))...)
+		tx.Inputs[i].UnlockingScript = script.NewFromBytes(u)
+		if j == 0 {
+			unlockLen = len(u)
+		}
 	}
-	u = append(u, pushData(pre)...)
-	u = append(u, pushNum(int64(s.method))...)
-	tx.Inputs[pi].UnlockingScript = script.NewFromBytes(u)
-
+	isPool := map[int]bool{}
+	for _, i := range poolIdx {
+		isPool[i] = true
+	}
 	for i, c := range ins {
-		if i != pi {
+		if !isPool[i] {
 			signP2pkh(t, tx, i, c.key)
 		}
 	}
-	return built{tx: tx, outs: outs, fee: fee, unlockLen: len(u)}
+	return built{tx: tx, outs: outs, fee: fee, unlockLen: unlockLen, poolIdx: poolIdx}
 }
 
-// prepare measures the spend at fee 0, sets the fee for that size at feeRate
-// (+4 bytes of signature-length slack), mints its unminted coins and builds
-// it for real.
-func (e *env) prepare(s *spend) built {
+// fund measures the spend at fee 0, sets the fee for that size at feeRate
+// (+4 bytes of signature-length slack) and mints its unminted coins (the
+// payer at exactly its share). Once minted, the payer's value fixes the fee.
+func (e *env) fund(s *spend) int64 {
 	draft := e.build(s, 0)
 	size := int64(len(draft.tx.Bytes())) + 4
 	fee := (size*feeRate + 999) / 1000
 	e.build(s, fee) // sets the payer's value
 	e.mint(s.others)
-	return e.build(s, fee)
+	return fee
 }
 
-// broadcast prepares and sends a spend, returning the node's answer.
-func (e *env) broadcast(s *spend) (built, string, error) {
-	b := e.prepare(s)
-	txid, err := node.SendRawTransaction(b.tx.Hex())
-	return b, txid, err
+// prepare funds the spend and builds it for real.
+func (e *env) prepare(s *spend) built {
+	return e.build(s, e.fund(s))
+}
+
+// interpret runs every pool input of b through the go-sdk interpreter
+// (Genesis + Chronicle rules, no policy flags) and returns each one's verdict
+// by input index.
+func interpret(s *spend, b built) map[int]error {
+	v := map[int]error{}
+	for j, p := range s.pools() {
+		i := b.poolIdx[j]
+		v[i] = interpreter.NewEngine().Execute(
+			interpreter.WithTx(b.tx, i, &transaction.TransactionOutput{Satoshis: uint64(p.st.bsv), LockingScript: script.NewFromBytes(p.lock)}),
+			interpreter.WithForkID(),
+			interpreter.WithAfterGenesis(),
+			interpreter.WithAfterChronicle(),
+		)
+	}
+	return v
+}
+
+func (e *env) logVerdicts(v map[int]error) {
+	var idx []int
+	for i := range v {
+		idx = append(idx, i)
+	}
+	sort.Ints(idx)
+	for _, i := range idx {
+		verdict := "passes"
+		if v[i] != nil {
+			verdict = "FAILS: " + v[i].Error()
+		}
+		e.t.Logf("  interpreter: pool input %d %s", i, verdict)
+	}
 }
 
 // accept broadcasts a spend the node must take, mines it, and re-reads the
@@ -849,17 +909,18 @@ func (e *env) broadcast(s *spend) (built, string, error) {
 func (e *env) accept(s *spend) (string, *transaction.Transaction) {
 	t := e.t
 	t.Helper()
-	if s.feeFromOut == 0 && s.payer != nil {
+	if s.feeFromOut >= 0 && s.payer != nil {
 		t.Fatal("spend has both a payer and feeFromOut")
 	}
-	b, txid, err := e.broadcast(s)
+	b := e.prepare(s)
 	size := int64(len(b.tx.Bytes()))
+	txid, err := node.SendRawTransaction(b.tx.Hex())
 	if err != nil {
-		record(txStat{test: t.Name(), label: s.label, size: size, fee: b.fee, unlockLen: b.unlockLen, reason: err.Error(), poolInputIdx: s.poolIndex})
-		e.diagnose(s, b)
+		record(txStat{test: t.Name(), label: s.label, size: size, fee: b.fee, unlockLen: b.unlockLen, reason: err.Error()})
+		e.logVerdicts(interpret(s, b))
 		t.Fatalf("HONEST SPEND REJECTED by the node: %s (%d bytes): %v", s.label, size, err)
 	}
-	record(txStat{test: t.Name(), label: s.label, size: size, fee: b.fee, unlockLen: b.unlockLen, accepted: true, poolInputIdx: s.poolIndex})
+	record(txStat{test: t.Name(), label: s.label, size: size, fee: b.fee, unlockLen: b.unlockLen, accepted: true})
 	t.Logf("%s: %s, %d bytes (unlock %d), fee %d sats", s.label, txid, size, b.unlockLen, b.fee)
 	confirm(t, txid)
 	got := fetchTx(t, txid)
@@ -872,24 +933,53 @@ func (e *env) accept(s *spend) (string, *transaction.Transaction) {
 			t.Fatalf("%s: output %d on chain is %d sats %x..., want %d sats %x...", s.label, i, g.Satoshis, firstN(*g.LockingScript, 40), o.sats, firstN(o.script, 40))
 		}
 	}
-	in := got.Inputs[s.poolIndex]
-	if in.SourceTXID.String() != s.pool.txid || int(in.SourceTxOutIndex) != s.pool.vout {
-		t.Fatalf("%s: input %d spends %s:%d, not the pool %s:%d", s.label, s.poolIndex, in.SourceTXID, in.SourceTxOutIndex, s.pool.txid, s.pool.vout)
-	}
-	if u, err := node.TxOut(s.pool.txid, s.pool.vout); err != nil || u != nil {
-		t.Fatalf("%s: the spent pool UTXO is still unspent (%v)", s.label, err)
+	for j, p := range s.pools() {
+		in := got.Inputs[b.poolIdx[j]]
+		if in.SourceTXID.String() != p.txid || int(in.SourceTxOutIndex) != p.vout {
+			t.Fatalf("%s: input %d spends %s:%d, not the pool %s:%d", s.label, b.poolIdx[j], in.SourceTXID, in.SourceTxOutIndex, p.txid, p.vout)
+		}
+		if u, err := node.TxOut(p.txid, p.vout); err != nil || u != nil {
+			t.Fatalf("%s: the spent pool UTXO is still unspent (%v)", s.label, err)
+		}
 	}
 	return txid, got
 }
 
-// reject broadcasts a spend the node must refuse: the refusal is the node's own
-// (an RPC error, not a transport failure or a build error) and contains want,
-// and the pool UTXO is still unspent afterwards. Returns the node's reason.
-func (e *env) reject(s *spend, want string) string {
+// consensusReject is the node's prefix for a script failure under the
+// consensus (mandatory) flags. A "non-mandatory-script-verify-flag" reason
+// would be a policy-only refusal and fails the assertion.
+const consensusReject = "mandatory-script-verify-flag-failed"
+
+// reject broadcasts a spend the node must refuse. Before broadcasting, the
+// go-sdk interpreter must fail exactly the pool inputs at failing (so a
+// harness defect cannot pass as a rejection); each failing input is traced
+// (the checksigs it ran, the opcodes before its error). The refusal must be
+// the node's own (an RPC error) containing want, and every pool the spend
+// touches must still be unspent afterwards. Returns the node's reason.
+func (e *env) reject(s *spend, want string, failing ...int) string {
 	t := e.t
 	t.Helper()
-	b, txid, err := e.broadcast(s)
+	b := e.prepare(s)
 	size := int64(len(b.tx.Bytes()))
+	v := interpret(s, b)
+	var gotFail []int
+	for i, err := range v {
+		if err != nil {
+			gotFail = append(gotFail, i)
+		}
+	}
+	sort.Ints(gotFail)
+	sort.Ints(failing)
+	if fmt.Sprint(gotFail) != fmt.Sprint(failing) {
+		t.Errorf("%s: the interpreter fails pool inputs %v, the case expects %v", s.label, gotFail, failing)
+	}
+	e.logVerdicts(v)
+	for _, i := range gotFail {
+		d := trace(s, b, i)
+		t.Logf("  trace: input %d: checksigs %v; %v after %v", i, d.checksigs, d.err, d.recent)
+	}
+
+	txid, err := node.SendRawTransaction(b.tx.Hex())
 	if err == nil {
 		record(txStat{test: t.Name(), label: s.label, size: size, fee: b.fee, unlockLen: b.unlockLen, accepted: true, reason: "ACCEPTED (expected a rejection)"})
 		t.Fatalf("NODE ACCEPTED a spend the design says it must reject: %s: %s", s.label, txid)
@@ -898,28 +988,17 @@ func (e *env) reject(s *spend, want string) string {
 	if !errors.As(err, &rpcErr) {
 		t.Fatalf("%s: not a node rejection (transport failure?): %v", s.label, err)
 	}
-	record(txStat{test: t.Name(), label: s.label, size: size, fee: b.fee, unlockLen: b.unlockLen, reason: rpcErr.Message, poolInputIdx: s.poolIndex})
+	record(txStat{test: t.Name(), label: s.label, size: size, fee: b.fee, unlockLen: b.unlockLen, reason: rpcErr.Message})
 	t.Logf("%s: rejected: %s", s.label, rpcErr.Message)
 	if !strings.Contains(rpcErr.Message, want) {
 		t.Errorf("%s: rejection %q does not contain %q", s.label, rpcErr.Message, want)
 	}
-	if u, err := node.TxOut(s.pool.txid, s.pool.vout); err != nil || u == nil {
-		t.Fatalf("%s: the pool UTXO %s:%d is no longer unspent after the rejection (%v)", s.label, s.pool.txid, s.pool.vout, err)
+	for _, p := range s.pools() {
+		if u, err := node.TxOut(p.txid, p.vout); err != nil || u == nil {
+			t.Fatalf("%s: the pool UTXO %s:%d is no longer unspent after the rejection (%v)", s.label, p.txid, p.vout, err)
+		}
 	}
 	return rpcErr.Message
-}
-
-// diagnose runs the pool input through the go-sdk interpreter (Genesis +
-// Chronicle rules) and logs its verdict, to explain a node rejection.
-func (e *env) diagnose(s *spend, b built) {
-	prev := &transaction.TransactionOutput{Satoshis: uint64(s.pool.st.bsv), LockingScript: script.NewFromBytes(s.pool.lock)}
-	err := interpreter.NewEngine().Execute(
-		interpreter.WithTx(b.tx, s.poolIndex, prev),
-		interpreter.WithForkID(),
-		interpreter.WithAfterGenesis(),
-		interpreter.WithAfterChronicle(),
-	)
-	e.t.Logf("diagnose %s: go-sdk interpreter says: %v", s.label, err)
 }
 
 func firstN(b []byte, n int) []byte { return b[:min(len(b), n)] }
@@ -928,28 +1007,34 @@ func firstN(b []byte, n int) []byte { return b[:min(len(b), n)] }
 // The three methods
 // ---------------------------------------------------------------------------
 
-// swapPlan is the reference math for one Swap (mirrors the contract).
+// swapPlan is the reference math for one Swap (mirrors the contract; Go's
+// integer division truncates toward zero as OP_DIV does, which matters for a
+// negative fee rate).
 type swapPlan struct {
 	amountIn                                  int64
 	bsvIn                                     bool
 	lpFee, validatorFee, commission, net, out int64
 	newBsv, newTokens                         int64
 	next                                      *ec.PrivateKey
-	user                                      *ec.PrivateKey // pays in, gets the payout
-	commissionPkh, tokenChangePkh             []byte
+	nextRaw                                   []byte // the next key's bytes, when not next's
+	user                                      *ec.PrivateKey
+	userPkh, commissionPkh, tokenChangePkh    []byte
 	tokenChange                               int64
 	satsChangePkh                             []byte
 	satsChange                                int64
 }
 
 func planSwap(t *testing.T, p *pool, amountIn int64, bsvIn bool) *swapPlan {
+	t.Helper()
+	user := newKey(t)
 	r := &swapPlan{
 		amountIn: amountIn, bsvIn: bsvIn,
 		lpFee:          (amountIn*p.p.lpBps + 9999) / 10000,
 		validatorFee:   (amountIn*p.p.validatorBps + 9999) / 10000,
 		commission:     (amountIn*p.p.commissionBps + 9999) / 10000,
 		next:           newKey(t),
-		user:           newKey(t),
+		user:           user,
+		userPkh:        pkh(user),
 		commissionPkh:  pkh(newKey(t)),
 		tokenChangePkh: pkh(newKey(t)),
 	}
@@ -968,28 +1053,39 @@ func planSwap(t *testing.T, p *pool, amountIn int64, bsvIn bool) *swapPlan {
 }
 
 func (r *swapPlan) nextState(p *pool) poolState {
-	return poolState{bsv: r.newBsv, tokens: r.newTokens, lp: p.st.lp, validator: r.next}
+	return poolState{bsv: r.newBsv, tokens: r.newTokens, lp: p.st.lp, validator: r.next, validatorRaw: r.nextRaw}
 }
+
+func (r *swapPlan) nextPub() []byte {
+	if r.nextRaw != nil {
+		return r.nextRaw
+	}
+	return r.next.PubKey().Compressed()
+}
+
+// validatorPkh is Hash160 of the state's ValidatorPubKey: where the
+// validator fee goes.
+func validatorPkh(st poolState) []byte { return crypto.Hash160(st.validatorPub()) }
 
 // swapSpend is the honest Swap for plan r: outputs as the contract builds
 // them; a sats-in swap's funding input pays amountIn + the token payout's sat
 // + the miner fee; a token-in swap brings a 1-sat token-prefixed input (the
 // node does not read its amount) plus a funding input for the fee and the
-// 1-sat token outputs.
+// 1-sat token outputs. The pool is input 0.
 func swapSpend(p *pool, r *swapPlan) *spend {
 	pp := p.p
 	outs := []out{{r.newBsv, poolScript(pp, p.code, r.nextState(p))}}
 	if r.bsvIn {
-		outs = append(outs, out{1, tokenP2pkh(pp.assetID, r.out, pkh(r.user))})
+		outs = append(outs, out{1, tokenP2pkh(pp.assetID, r.out, r.userPkh)})
 	} else {
-		outs = append(outs, out{r.out, p2pkhScript(pkh(r.user))})
+		outs = append(outs, out{r.out, p2pkhScript(r.userPkh)})
 	}
 	lpPkh := pp.lpTokenPkh
 	if r.bsvIn {
 		lpPkh = pp.lpSatsPkh
 	}
 	fee := func(amount int64, to []byte) {
-		if amount == 0 {
+		if amount <= 0 { // the contract writes a fee output only when it is > 0
 			return
 		}
 		if r.bsvIn {
@@ -999,7 +1095,7 @@ func swapSpend(p *pool, r *swapPlan) *spend {
 		}
 	}
 	fee(r.lpFee, lpPkh)
-	fee(r.validatorFee, pkh(p.st.validator))
+	fee(r.validatorFee, validatorPkh(p.st))
 	fee(r.commission, r.commissionPkh)
 	if r.tokenChange > 0 {
 		outs = append(outs, out{1, tokenP2pkh(pp.assetID, r.tokenChange, r.tokenChangePkh)})
@@ -1007,8 +1103,8 @@ func swapSpend(p *pool, r *swapPlan) *spend {
 	s := &spend{
 		label:  fmt.Sprintf("swap %s %d", map[bool]string{true: "sats-in", false: "token-in"}[r.bsvIn], r.amountIn),
 		method: methodSwap, pool: p, feeFromOut: -1,
-		args: [][]byte{nil, pushData(r.next.PubKey().Compressed()), pushNum(r.amountIn), pushBool(r.bsvIn),
-			pushData(pkh(r.user)), pushData(r.commissionPkh), pushData(r.tokenChangePkh), pushNum(r.tokenChange)},
+		args: [][]byte{nil, pushData(r.nextPub()), pushNum(r.amountIn), pushBool(r.bsvIn),
+			pushData(r.userPkh), pushData(r.commissionPkh), pushData(r.tokenChangePkh), pushNum(r.tokenChange)},
 		signer: p.st.validator,
 	}
 	if r.satsChange > 0 {
@@ -1019,8 +1115,7 @@ func swapSpend(p *pool, r *swapPlan) *spend {
 	if !r.bsvIn {
 		s.others = append(s.others, &coin{sats: 1, lock: tokenP2pkh(pp.assetID, r.amountIn+r.tokenChange, pkh(r.user)), key: r.user})
 	}
-	payKey := r.user
-	s.payer = &coin{lock: p2pkhScript(pkh(payKey)), key: payKey}
+	s.payer = &coin{lock: p2pkhScript(pkh(r.user)), key: r.user}
 	s.others = append(s.others, s.payer)
 	return s
 }
@@ -1028,13 +1123,16 @@ func swapSpend(p *pool, r *swapPlan) *spend {
 // swap runs an honest Swap, checks the value flow, and moves p to the
 // continuation.
 func (e *env) swap(p *pool, r *swapPlan) string {
-	t := e.t
-	t.Helper()
-	s := swapSpend(p, r)
-	return e.swapWith(p, r, s)
+	e.t.Helper()
+	return e.swapWith(p, r, swapSpend(p, r))
 }
 
 func (e *env) swapWith(p *pool, r *swapPlan, s *spend) string {
+	txid, _ := e.swapWithTx(p, r, s)
+	return txid
+}
+
+func (e *env) swapWithTx(p *pool, r *swapPlan, s *spend) (string, *transaction.Transaction) {
 	t := e.t
 	t.Helper()
 	before := p.st.bsv
@@ -1050,7 +1148,7 @@ func (e *env) swapWith(p *pool, r *swapPlan, s *spend) string {
 		}
 	}
 	p.txid, p.vout, p.st, p.lock = txid, 0, r.nextState(p), s.outs[0].script
-	return txid
+	return txid, got
 }
 
 // rescindSpend is the validator's honest Rescind: the pool written back with
@@ -1058,7 +1156,7 @@ func (e *env) swapWith(p *pool, r *swapPlan, s *spend) string {
 // the fee, with Rúnar change when change > 0.
 func rescindSpend(t *testing.T, p *pool, change int64) *spend {
 	r := p.st
-	r.rescinded = true
+	r.rescinded, r.validatorRaw = true, nil
 	payKey := newKey(t)
 	s := &spend{
 		label: "rescind", method: methodRescind, pool: p, feeFromOut: -1,
@@ -1082,7 +1180,7 @@ func (e *env) rescind(p *pool, change int64) string {
 		e.t.Fatalf("rescind moved the pool's sats: %d -> %d", p.st.bsv, got.Outputs[0].Satoshis)
 	}
 	p.txid, p.vout, p.lock = txid, 0, s.outs[0].script
-	p.st.rescinded = true
+	p.st.rescinded, p.st.validatorRaw = true, nil
 	return txid
 }
 
@@ -1101,14 +1199,117 @@ func closeSpend(t *testing.T, p *pool) *spend {
 }
 
 func (e *env) close(p *pool) string {
-	s := closeSpend(e.t, p)
-	txid, _ := e.accept(s)
+	txid, _ := e.accept(closeSpend(e.t, p))
 	p.txid = ""
 	return txid
 }
 
-// newPoolState is a fresh pool's state: 1,000,000 sats against 5,000,000
-// tokens (realistic magnitudes: the swap products exceed 4-byte numbers).
-func newPoolState(t *testing.T) poolState {
-	return poolState{bsv: 1_000_000, tokens: 5_000_000, lp: newKey(t), validator: newKey(t)}
+// atIndex1 moves s's pool to input 1, behind a funding input: the fee payer
+// itself when s has one, else a fresh payer.
+func atIndex1(t *testing.T, s *spend) *spend {
+	if s.payer == nil {
+		k := newKey(t)
+		s.payer = &coin{lock: p2pkhScript(pkh(k)), key: k}
+		s.others = append([]*coin{s.payer}, s.others...)
+		s.feeFromOut = -1
+	} else {
+		rest := []*coin{s.payer}
+		for _, c := range s.others {
+			if c != s.payer {
+				rest = append(rest, c)
+			}
+		}
+		s.others = rest
+	}
+	s.poolIndex = 1
+	return s
+}
+
+// ---------------------------------------------------------------------------
+// Tracing a failing input (go-sdk interpreter debugger)
+// ---------------------------------------------------------------------------
+
+type tracer struct {
+	checksigs []checksig
+	recent    []string // the last opcodes executed in the locking script
+	err       error
+	pending   *checksig
+}
+
+type checksig struct {
+	op     string
+	pubKey []byte
+	ok     bool
+}
+
+func (c checksig) String() string { return fmt.Sprintf("%s(%x..)=%v", c.op, firstN(c.pubKey, 4), c.ok) }
+
+func executing(s *interpreter.State) bool {
+	return s.ScriptIdx == 1 && (len(s.CondStack) == 0 || s.CondStack[len(s.CondStack)-1] == 1)
+}
+
+func (d *tracer) BeforeExecute(*interpreter.State) {}
+func (d *tracer) AfterExecute(*interpreter.State)  {}
+func (d *tracer) BeforeStep(*interpreter.State)    {}
+func (d *tracer) AfterStep(*interpreter.State)     {}
+func (d *tracer) BeforeExecuteOpcode(s *interpreter.State) {
+	d.pending = nil
+	if !executing(s) {
+		return
+	}
+	op := s.Opcode()
+	name := op.Name()
+	if len(op.Data) > 0 && len(op.Data) <= 4 {
+		name = fmt.Sprintf("%s(%x)", name, op.Data)
+	}
+	d.recent = append(d.recent, name)
+	if len(d.recent) > 10 {
+		d.recent = d.recent[1:]
+	}
+	if n := op.Name(); n == "OP_CHECKSIG" || n == "OP_CHECKSIGVERIFY" {
+		d.pending = &checksig{op: n, pubKey: append([]byte{}, s.DataStack[len(s.DataStack)-1]...)}
+	}
+}
+func (d *tracer) AfterExecuteOpcode(s *interpreter.State) {
+	if d.pending == nil {
+		return
+	}
+	c := *d.pending
+	d.pending = nil
+	c.ok = true // a failed OP_CHECKSIGVERIFY errors out instead
+	if c.op == "OP_CHECKSIG" {
+		top := s.DataStack[len(s.DataStack)-1]
+		c.ok = len(top) > 0 && !bytes.Equal(top, []byte{0})
+	}
+	d.checksigs = append(d.checksigs, c)
+}
+func (d *tracer) BeforeScriptChange(*interpreter.State)      {}
+func (d *tracer) AfterScriptChange(*interpreter.State)       {}
+func (d *tracer) AfterSuccess(*interpreter.State)            {}
+func (d *tracer) AfterError(_ *interpreter.State, err error) { d.err = err }
+func (d *tracer) BeforeStackPush(*interpreter.State, []byte) {}
+func (d *tracer) AfterStackPush(*interpreter.State, []byte)  {}
+func (d *tracer) BeforeStackPop(*interpreter.State)          {}
+func (d *tracer) AfterStackPop(*interpreter.State, []byte)   {}
+
+// trace re-runs pool input idx of b with the tracer attached.
+func trace(s *spend, b built, idx int) *tracer {
+	var p *pool
+	for j, q := range s.pools() {
+		if b.poolIdx[j] == idx {
+			p = q
+		}
+	}
+	d := &tracer{}
+	err := interpreter.NewEngine().Execute(
+		interpreter.WithTx(b.tx, idx, &transaction.TransactionOutput{Satoshis: uint64(p.st.bsv), LockingScript: script.NewFromBytes(p.lock)}),
+		interpreter.WithForkID(),
+		interpreter.WithAfterGenesis(),
+		interpreter.WithAfterChronicle(),
+		interpreter.WithDebugger(d),
+	)
+	if d.err == nil {
+		d.err = err
+	}
+	return d
 }

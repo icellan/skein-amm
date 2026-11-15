@@ -9,7 +9,8 @@
 # the root go.mod pins (from the Go module cache / proxy) instead of the
 # sibling checkout.
 #
-# Env: RUNAR_DIR (default ../../../runar), INSTANCE (default skein-amm;
+# Env: RUNAR_DIR (default ../../../runar, the sibling of the checkout; it must
+# contain Rúnar commit 6bd5e29f4, checked below), INSTANCE (default skein-amm;
 # "default" = regtest.sh's unnamed instance on 18332), RPC_URL (default
 # derived from INSTANCE), FEE_RATE_SAT_PER_KB (default 100).
 set -euo pipefail
@@ -32,6 +33,15 @@ if [ ! -x "$RUNAR_DIR/integration/regtest.sh" ]; then
   exit 1
 fi
 RUNAR_DIR="$(cd "$RUNAR_DIR" && pwd)"
+
+# The suite needs a Rúnar at or past this commit; an older checkout (e.g. a
+# stale sibling clone) would silently compile the pool with an old compiler.
+RUNAR_MIN_COMMIT=6bd5e29f4
+if ! git -C "$RUNAR_DIR" merge-base --is-ancestor "$RUNAR_MIN_COMMIT" HEAD 2>/dev/null; then
+  echo "the Rúnar checkout at $RUNAR_DIR does not contain commit $RUNAR_MIN_COMMIT" >&2
+  echo "(HEAD: $(git -C "$RUNAR_DIR" log --oneline -1 2>/dev/null || echo 'not a git checkout')); set RUNAR_DIR to an up-to-date checkout" >&2
+  exit 1
+fi
 
 INSTANCE="${INSTANCE:-skein-amm}"
 if [ "$INSTANCE" = "default" ]; then

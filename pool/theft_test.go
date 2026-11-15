@@ -3,8 +3,7 @@ package pool
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
+	"encoding/binary"
 	"fmt"
 	"math/big"
 	"strings"
@@ -18,34 +17,50 @@ import (
 	"github.com/bsv-blockchain/go-sdk/script/interpreter"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	sighash "github.com/bsv-blockchain/go-sdk/transaction/sighash"
-	"github.com/icellan/runar/compilers/go/compiler"
-	runar "github.com/icellan/runar/packages/runar-go"
 )
 
 // Adversarial tests for the pool contract. Everything runs through the go-sdk
-// interpreter on a real two-input transaction; the helpers prefixed adv are a
-// more flexible sibling of fixture.run (other sighash types, a signature made
-// for another transaction, extra inputs, raw method pushes, extra pushes).
+// interpreter on a real transaction (the pool and a funding input, more on
+// request); the helpers prefixed adv are a more flexible sibling of
+// fixture.run (other sighash types, a signature made for another transaction,
+// extra inputs, raw method pushes, extra pushes).
 
 // --- runner ---
 
 type advOpts struct {
-	preFlag  sighash.Flag             // type of the pushed txPreimage; 0 = ALL|FORKID
-	sigFlag  sighash.Flag             // sighash type of the signatures; 0 = ALL|FORKID
-	sigTx    *transaction.Transaction // signatures are made over this tx instead of the real one
-	salt     byte                     // xored into the pool outpoint txid of the real tx
-	extraIns int                      // additional inputs after the funding input
-	method   []byte                   // raw push replacing the method index
-	leading  [][]byte                 // pushes below the _codePart
-	trailing [][]byte                 // pushes after the method index
-	codePart []byte                   // replaces the _codePart
-	chPkh    []byte                   // raw push replacing _changePKH
-	chAmt    []byte                   // raw push replacing _changeAmount
-	sigTweak func([]byte) []byte      // applied to each signature (DER + type byte) before pushing
-	noPre    bool                     // omit the preimage push
+	preFlag     sighash.Flag             // type of the pushed txPreimage; 0 = ALL|FORKID
+	sigFlag     sighash.Flag             // sighash type of the signatures; 0 = ALL|FORKID
+	sigTx       *transaction.Transaction // signatures are made over this tx instead of the real one
+	salt        byte                     // xored into the pool outpoint txid of the real tx
+	extraIns    int                      // additional inputs after the pool and funding inputs
+	extraBefore int                      // additional inputs before them (the pool's index moves up)
+	method      []byte                   // raw push replacing the method index
+	leading     [][]byte                 // pushes below the first argument (below _codePart where there is one)
+	trailing    [][]byte                 // pushes after the method index
+	codePart    []byte                   // replaces the _codePart (Swap and Rescind)
+	prevouts    []byte                   // replaces allPrevouts (Swap and Rescind); nil: the transaction's own
+	prevoutsRaw []byte                   // a raw push replacing the allPrevouts push
+	chPkh       []byte                   // raw push replacing _changePKH
+	chAmt       []byte                   // raw push replacing _changeAmount
+	sigTweak    func([]byte) []byte      // applied to each signature (DER + type byte) before pushing
+	noPre       bool                     // omit the preimage push
 	// noChronicle runs the interpreter without the Chronicle upgrade (legacy sighash off).
 	noChronicle bool
 }
+
+// advPrevouts is the transaction's input outpoints, 36 bytes each, in order:
+// what Swap and Rescind take as allPrevouts.
+func advPrevouts(tx *transaction.Transaction) []byte {
+	var b []byte
+	for _, in := range tx.Inputs {
+		b = append(b, in.SourceTXID.CloneBytes()...)
+		b = binary.LittleEndian.AppendUint32(b, in.SourceTxOutIndex)
+	}
+	return b
+}
+
+// advIndex is the pool's input index in the transaction advTx builds.
+func advIndex(c call, o advOpts) int { return o.extraBefore + c.poolIndex }
 
 func advFlag(f, def sighash.Flag) sighash.Flag {
 	if f == 0 {
@@ -68,6 +83,10 @@ func (f *fixture) advTx(p pool, c call, o advOpts) (*transaction.Transaction, *t
 	poolIn := &transaction.TransactionInput{SourceTXID: prevTxid, SourceTxOutIndex: 0, SequenceNumber: 0xffffffff}
 	poolIn.SetSourceTxOutput(prevOut)
 	fundIn := &transaction.TransactionInput{SourceTXID: fundTxid, SourceTxOutIndex: 0, SequenceNumber: 0xffffffff}
+	for i := 0; i < o.extraBefore; i++ {
+		id, _ := chainhash.NewHash(bytes.Repeat([]byte{byte(0x33 + i)}, 32))
+		tx.AddInput(&transaction.TransactionInput{SourceTXID: id, SourceTxOutIndex: uint32(i + 1), SequenceNumber: 0xffffffff})
+	}
 	if c.poolIndex == 0 {
 		tx.AddInput(poolIn)
 		tx.AddInput(fundIn)
@@ -132,15 +151,29 @@ func (f *fixture) advUnlock(t *testing.T, tx *transaction.Transaction, pi int, l
 	for _, l := range o.leading {
 		u = append(u, l...)
 	}
-	code := f.code
-	if o.codePart != nil {
-		code = o.codePart
+	if c.method != methodClose { // _codePart: the methods that write a continuation
+		code := f.code
+		if o.codePart != nil {
+			code = o.codePart
+		}
+		u = append(u, pushData(code)...)
 	}
-	u = append(u, pushData(code)...)
 	for _, a := range args {
 		u = append(u, a...)
 	}
-	if c.method != methodClose {
+	if c.method != methodClose { // allPrevouts, then Rúnar's change parameters
+		prevouts := c.prevouts
+		if o.prevouts != nil {
+			prevouts = o.prevouts
+		}
+		if prevouts == nil {
+			prevouts = advPrevouts(tx)
+		}
+		if o.prevoutsRaw != nil {
+			u = append(u, o.prevoutsRaw...)
+		} else {
+			u = append(u, pushData(prevouts)...)
+		}
 		changePkh, change := make([]byte, 20), int64(0)
 		if c.change != nil {
 			changePkh, change = c.change.pkh, c.change.sats
@@ -205,7 +238,7 @@ func advExecuteC(tx *transaction.Transaction, pi int, prevOut *transaction.Trans
 func (f *fixture) advRun(t *testing.T, p pool, c call, o advOpts) error {
 	t.Helper()
 	tx, prevOut, lock := f.advTx(p, c, o)
-	pi := c.poolIndex
+	pi := advIndex(c, o)
 	tx.Inputs[pi].UnlockingScript = script.NewFromBytes(f.advUnlock(t, tx, pi, lock, uint64(p.bsv), c, o))
 	return advExecuteC(tx, pi, prevOut, !o.noChronicle)
 }
@@ -316,52 +349,16 @@ func advSetRaw(c call, raw []byte) call {
 	return c
 }
 
-func advIsHead(t *testing.T) bool {
-	t.Helper()
-	art, err := compiler.CompileFromSource("Pool.runar.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	js, err := compiler.ArtifactToJSON(art)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return bytes.Contains(js, []byte("codePartLenSlots"))
-}
-
 // advCode is the pool code with the given readonly args spliced in (as
 // newFixture builds it, but with a choosable asset id).
 func advCode(t *testing.T, asset []byte, lpBps, vBps, cBps int64) []byte {
 	t.Helper()
-	art, err := compiler.CompileFromSource("Pool.runar.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	js, _ := compiler.ArtifactToJSON(art)
-	var sa runar.RunarArtifact
-	if err := json.Unmarshal(js, &sa); err != nil {
-		t.Fatal(err)
-	}
-	p := pool{tokens: 1000, lp: key(t, 1), validator: key(t, 2)}
-	c := runar.NewRunarContract(&sa, []interface{}{
-		p.tokens,
-		hex.EncodeToString(p.lp.PubKey().Compressed()),
-		hex.EncodeToString(p.validator.PubKey().Compressed()),
-		hex.EncodeToString(validatorIdentity.PubKey().Compressed()),
-		hex.EncodeToString(nonce),
-		hex.EncodeToString(lpSatsPkh),
-		hex.EncodeToString(lpTokenPkh),
-		hex.EncodeToString(affirmation),
-		hex.EncodeToString(asset),
-		lpBps, vBps, cBps,
-	})
-	full, _ := hex.DecodeString(c.GetLockingScript())
-	return full[:len(full)-1-len(p.state())]
+	return deltaCode(t, asset, [3]int64{lpBps, vBps, cBps})
 }
 
 // State layout offsets (see pool.state): tokens 0, LpPubKey 8, ValidatorPubKey
 // 41, ValidatorIdentity 74, Nonce 107, LpSatsPkh 139, LpTokenPkh 159,
-// Affirmation (length byte) 179.
+// AffirmationR 179, AffirmationS 211; 243 bytes in all.
 const (
 	offTokens   = 0
 	offLp       = 8
@@ -370,7 +367,9 @@ const (
 	offNonce    = 107
 	offSats     = 139
 	offTokenPkh = 159
-	offAffLen   = 179
+	offAffR     = 179
+	offAffS     = 211
+	stateLen    = 243
 )
 
 // advLock assembles a pool output script from its parts.
@@ -508,153 +507,181 @@ func TestTheft_PreimageSighashType(t *testing.T) {
 	})
 }
 
-// What the script does when the signer's own signature uses another sighash
-// type (the preimage stays ALL|FORKID). Observed on both Rúnar versions, in
-// the go-sdk interpreter (node policy was not tested): every type that carries
-// FORKID is accepted; ALL without FORKID (the legacy sighash) is accepted only
-// with the Chronicle upgrade enabled in the engine, refused without it.
+// advSigFlags are the signature types other than ALL|FORKID. (A type byte
+// with an undefined bit, 0x61 say, is refused by the interpreter's own
+// CHECKSIG, so it cannot show what requireSighashAll does.)
+var advSigFlags = advFlags
+
+// The signer's own signature must be ALL|FORKID (requireSighashAll), on every
+// method. Every signature here is a valid signature of its type, made over the
+// digest the interpreter computes for that type (the legacy digest without
+// FORKID). Swap and Rescind run CHECKSIG first: a wrong signer fails there,
+// the right signer gets past it and fails the type check, a different error.
+// Close checks the type first. The same transaction signed ALL|FORKID passes,
+// so the signature's type is the only difference. Without the Chronicle
+// upgrade the legacy digest fails CHECKSIG itself.
 func TestTheft_SignatureSighashType(t *testing.T) {
 	advEach(t, func(t *testing.T, f *fixture, p pool, bsvIn bool) {
 		for method := 0; method < 3; method++ {
-			for _, fl := range advFlags {
-				method, fl := method, fl
-				t.Run(advMethodNames[method]+": signature "+fl.name, func(t *testing.T) {
-					c := advValid(f, p, method, bsvIn)
-					err := f.advRun(t, p, c, advOpts{sigFlag: fl.flag})
-					t.Logf("%s sig %s: accepted=%v (%v)", advMethodNames[method], fl.name, err == nil, err)
-					if err != nil {
-						t.Fatalf("expected accepted (the signer's own choice), got %v", err)
+			method := method
+			mn := advMethodNames[method]
+			base := advValid(f, p, method, bsvIn)
+			wrong := p.lp
+			if method == methodClose {
+				wrong = p.validator
+			}
+			t.Run(mn+": ALL|FORKID (control)", func(t *testing.T) {
+				mustPass(t, f.advRun(t, p, base, advOpts{}))
+			})
+			for _, fl := range advSigFlags {
+				fl := fl
+				t.Run(mn+": signature "+fl.name, func(t *testing.T) {
+					r := f.advRun(t, p, base, advOpts{sigFlag: fl.flag})
+					w := f.advRun(t, p, advSetSigner(base, wrong), advOpts{sigFlag: fl.flag})
+					t.Logf("right signer: %v; wrong signer: %v", r, w)
+					mustFail(t, r)
+					mustFail(t, w)
+					if method != methodClose && r.Error() == w.Error() {
+						t.Fatalf("the right signer's %s signature failed where a wrong signer's does (%v): not the type check", fl.name, r)
 					}
 					if fl.flag&sighash.ForkID == 0 {
-						errNC := f.advRun(t, p, c, advOpts{sigFlag: fl.flag, noChronicle: true})
-						t.Logf("%s sig %s without Chronicle: %v", advMethodNames[method], fl.name, errNC)
-						if errNC == nil {
-							t.Fatal("expected the legacy sighash to be refused without Chronicle")
-						}
+						mustFail(t, f.advRun(t, p, base, advOpts{sigFlag: fl.flag, noChronicle: true}))
 					}
 				})
 			}
 		}
-		// Swap and Rescind pin their outputs through the preimage whatever the
-		// signature covers: a NONE signature does not let a third party change them.
-		for _, method := range []int{methodSwap, methodRescind} {
-			method := method
-			mn := advMethodNames[method]
-			t.Run(mn+": NONE|FORKID signature: pool outputs stay pinned, the change outputs do not", func(t *testing.T) {
-				thief := pkh(key(t, 0x66))
-				c := advValid(f, p, method, bsvIn)
-				if method == methodSwap {
-					c = f.withChange(c, 7_777, pkh(key(t, 70)), 12_345)
-				}
-				signed, _, _ := f.advTx(p, c, advOpts{})
-				// A third party redirects only the outputs the contract takes from unlocking
-				// arguments: Rúnar's sats change (_changePKH, _changeAmount) and, on a
-				// Swap, the taker's token change (tokenChangePkh).
-				d := c
-				d.outs = advCopy(c.outs)
-				d.args = append([][]byte{}, c.args...)
-				d.change = &struct {
-					pkh  []byte
-					sats int64
-				}{thief, c.change.sats - 1000}
-				d.outs[len(d.outs)-1] = out{c.change.sats - 1000, p2pkh(thief)}
-				if method == methodSwap {
-					d.args[6] = pushData(thief)
-					d.outs[len(d.outs)-2] = out{1, tokenP2pkh(7_777, thief)}
-				}
-				// control: an ALL|FORKID signature binds them
-				mustFail(t, f.advRun(t, p, d, advOpts{sigTx: signed}))
-				// NONE does not: the change outputs are redirectable by a third party
-				mustPass(t, f.advRun(t, p, d, advOpts{sigFlag: 0x42, sigTx: signed}))
-				t.Logf("%s: with a NONE|FORKID validator signature a third party redirected the change output(s)", mn)
-				// ... but not the pool's own outputs
-				drain := c
-				drain.outs = advCopy(c.outs)
-				drain.outs[0] = out{1, f.poolScript(pool{bsv: 1, tokens: p.tokens, lp: p.lp, validator: next(p.validator)})}
-				drain.outs[1] = out{p.bsv - 1, p2pkh(thief)}
-				mustFail(t, f.advRun(t, p, drain, advOpts{sigFlag: 0x42, sigTx: signed}))
-			})
-			t.Run(mn+": ALL|ANYONECANPAY|FORKID signature with an input added", func(t *testing.T) {
-				// The validator's signature then no longer binds the input set it vetted:
-				// a third party can add inputs (outputs stay pinned by the contract).
-				c := advValid(f, p, method, bsvIn)
-				signed, _, _ := f.advTx(p, c, advOpts{})
-				err := f.advRun(t, p, c, advOpts{sigFlag: 0xC1, sigTx: signed, extraIns: 1})
-				t.Logf("%s with an ANYONECANPAY signature and an extra input: accepted=%v", mn, err == nil)
-				mustPass(t, err)
-			})
-			t.Run(mn+": ALL|FORKID signature with an input added", func(t *testing.T) {
-				c := advValid(f, p, method, bsvIn)
-				signed, _, _ := f.advTx(p, c, advOpts{})
-				mustFail(t, f.advRun(t, p, c, advOpts{sigTx: signed, extraIns: 1}))
-			})
-		}
 	})
 }
 
-// Close commits to no outputs. If the LP signs with a type that leaves outputs
-// out of the signature, a third party who sees the signed Close can rebuild the
-// transaction with other outputs and reuse the signature. That is the LP's own
-// choice (wallets sign ALL|FORKID); this documents the consequence.
-//   - NONE: every output replaceable. SINGLE: all but the one at the pool's
-//     input index. ALL|ANYONECANPAY: outputs fixed, inputs addable.
-//     NONE|ANYONECANPAY: everything but the pool outpoint replaceable.
-func TestTheft_CloseWithPartialSighashSignature(t *testing.T) {
+// Attempts around the type check: a last byte of 0x41 on a signature made over
+// another type's digest (CHECKSIG hashes by the last byte, so it is the
+// ALL|FORKID digest that must verify), an empty signature, the single byte
+// 41, bytes after the type byte. Every one is refused; the reason is logged.
+func TestTheft_SignatureSighashTypeBypass(t *testing.T) {
 	f := advFix(t, advCfg{30, 5, 10})
 	p := advPool(t)
-	thief := pkh(key(t, 0x66))
-	signed := f.closeCall(p)
-	signedTx, _, _ := f.advTx(p, signed, advOpts{})
-
-	cases := []struct {
-		name       string
-		flag       sighash.Flag
-		allOuts    bool // every output replaced
-		firstOnly  bool // only output 0 (the pool's input index) kept, rest replaced
-		replaceOne bool // output 0 replaced, others kept
-		extraIn    bool // an input added
-		wantPass   bool
-	}{
-		{"ALL: all outputs replaced", 0x41, true, false, false, false, false},
-		{"ALL: an input added", 0x41, false, false, false, true, false},
-		{"NONE: all outputs replaced", 0x42, true, false, false, false, true},
-		{"NONE: an input added", 0x42, false, false, false, true, false},
-		{"SINGLE: outputs other than 0 replaced", 0x43, false, true, false, false, true},
-		{"SINGLE: output 0 replaced", 0x43, false, false, true, false, false},
-		{"ALL|ANYONECANPAY: all outputs replaced", 0xC1, true, false, false, false, false},
-		{"ALL|ANYONECANPAY: an input added", 0xC1, false, false, false, true, true},
-		{"NONE|ANYONECANPAY: all outputs replaced", 0xC2, true, false, false, false, true},
-		{"NONE|ANYONECANPAY: outputs replaced and an input added", 0xC2, true, false, false, true, true},
-		{"SINGLE|ANYONECANPAY: outputs other than 0 replaced, an input added", 0xC3, false, true, false, true, true},
-		{"SINGLE|ANYONECANPAY: output 0 replaced", 0xC3, false, false, true, false, false},
+	set41 := func(b []byte) []byte { b[len(b)-1] = 0x41; return b }
+	for method := 0; method < 3; method++ {
+		method := method
+		mn := advMethodNames[method]
+		base := advValid(f, p, method, true)
+		cases := []struct {
+			name string
+			c    call
+			o    advOpts
+		}{
+			{"NONE|FORKID digest, last byte rewritten to 41", base, advOpts{sigFlag: 0x42, sigTweak: set41}},
+			{"SINGLE|FORKID digest, last byte rewritten to 41", base, advOpts{sigFlag: 0x43, sigTweak: set41}},
+			{"ALL|ANYONECANPAY|FORKID digest, last byte rewritten to 41", base, advOpts{sigFlag: 0xc1, sigTweak: set41}},
+			{"legacy ALL digest, last byte rewritten to 41", base, advOpts{sigFlag: 0x01, sigTweak: set41}},
+			{"empty signature", advSetRaw(base, []byte{0x00}), advOpts{}},
+			{"the single byte 41", advSetRaw(base, []byte{0x01, 0x41}), advOpts{}},
+			{"the bytes 41 41", advSetRaw(base, []byte{0x02, 0x41, 0x41}), advOpts{}},
+			{"a valid ALL|FORKID signature with 41 appended", base, advOpts{sigTweak: func(b []byte) []byte { return append(b, 0x41) }}},
+			{"a valid NONE|FORKID signature with 41 appended", base, advOpts{sigFlag: 0x42, sigTweak: func(b []byte) []byte { return append(b, 0x41) }}},
+			{"a valid ALL|FORKID signature with 00 inserted before its type byte", base, advOpts{sigTweak: func(b []byte) []byte {
+				return append(append(append([]byte{}, b[:len(b)-1]...), 0x00), 0x41)
+			}}},
+		}
+		t.Run(mn+": control", func(t *testing.T) { mustPass(t, f.advRun(t, p, base, advOpts{})) })
+		for _, c := range cases {
+			c := c
+			t.Run(mn+": "+c.name, func(t *testing.T) {
+				mustFail(t, f.advRun(t, p, c.c, c.o))
+			})
+		}
 	}
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			c := f.closeCall(p)
-			steal := []out{{p.bsv - 500, p2pkh(thief)}, {1, tokenP2pkh(p.tokens, thief)}}
-			switch {
-			case tc.allOuts:
-				c.outs = steal
-			case tc.firstOnly:
-				c.outs = []out{signed.outs[0], steal[1], {1, p2pkh(thief)}}
-			case tc.replaceOne:
-				c.outs = []out{steal[0], signed.outs[1]}
-			}
-			o := advOpts{sigFlag: tc.flag, sigTx: signedTx}
-			if tc.extraIn {
-				o.extraIns = 1
-			}
-			err := f.advRun(t, p, c, o)
-			if tc.wantPass {
-				if err != nil {
-					t.Fatalf("expected the third party's rebuilt Close to be accepted: %v", err)
+}
+
+// What the type check prevents: a signature that leaves outputs or inputs
+// out, reused by a third party over a transaction of its own. Swap and Rescind
+// pin their own outputs through the preimage, but the unlocking arguments
+// (payout and change addresses, the next key, amountIn, the direction) and
+// the inputs are covered only by the signer's signature; Close commits to no
+// output at all. Each rebuild below was accepted before requireSighashAll; now
+// the partial signature is refused outright, on the untouched transaction too,
+// and the same rebuild under the signer's ALL|FORKID signature fails CHECKSIG.
+func TestTheft_PartialSighashSignatureCannotBeReused(t *testing.T) {
+	thief := pkh(key(t, 0x66))
+	thiefKey := key(t, 0x67)
+	satsPkh := pkh(key(t, 70))
+	type rebuild struct {
+		name          string
+		flag          sighash.Flag
+		signed, s     call
+		signedO, rebO advOpts
+	}
+	for _, cfg := range advCfgs {
+		f := advFix(t, cfg)
+		p := advPool(t)
+		var cases []rebuild
+
+		cl := f.closeCall(p)
+		steal := []out{{p.bsv - 500, p2pkh(thief)}, {1, tokenP2pkh(p.tokens, thief)}}
+		withOuts := func(c call, o []out) call { c.outs = o; return c }
+		cases = append(cases,
+			rebuild{"Close, LP NONE: all outputs to the thief", 0x42, cl, withOuts(cl, steal), advOpts{}, advOpts{}},
+			rebuild{"Close, LP SINGLE: outputs other than 0 to the thief", 0x43, cl, withOuts(cl, []out{cl.outs[0], steal[1], {1, p2pkh(thief)}}), advOpts{}, advOpts{}},
+			rebuild{"Close, LP ALL|ANYONECANPAY: an input added", 0xc1, cl, cl, advOpts{}, advOpts{extraIns: 1}},
+			rebuild{"Close, LP NONE|ANYONECANPAY: outputs to the thief, an input added", 0xc2, cl, withOuts(cl, steal), advOpts{}, advOpts{extraIns: 1}},
+			rebuild{"Close, LP SINGLE|ANYONECANPAY: outputs other than 0 to the thief, an input added", 0xc3, cl, withOuts(cl, []out{cl.outs[0], steal[1]}), advOpts{}, advOpts{extraIns: 1}},
+		)
+		for _, bsvIn := range []bool{true, false} {
+			d := map[bool]string{true: "bsv in", false: "tokens in"}[bsvIn]
+			swap := func(g *fixture, amountIn int64, dir bool, nextKey *ec.PrivateKey, tcPkh, chPkh []byte) call {
+				r := g.expectSwap(p, amountIn, dir)
+				if nextKey != nil {
+					r.nextValidator = nextKey
 				}
-				t.Logf("third party redirected the pool's funds with the LP's %s signature", tc.name)
-			} else {
-				mustFail(t, err)
+				h := *g
+				h.changePkh = tcPkh
+				return h.withChange(h.swapCall(p, amountIn, dir, r), 7_777, chPkh, 12_345)
 			}
-		})
+			signed := swap(f, 20_000, bsvIn, nil, f.changePkh, satsPkh)
+			toThief := *f
+			toThief.userPkh = thief
+			cases = append(cases,
+				rebuild{"Swap " + d + ", validator NONE: payout to the thief", 0x42, signed, swap(&toThief, 20_000, bsvIn, nil, f.changePkh, satsPkh), advOpts{}, advOpts{}},
+				rebuild{"Swap " + d + ", validator NONE: the thief as next validator", 0x42, signed, swap(f, 20_000, bsvIn, thiefKey, f.changePkh, satsPkh), advOpts{}, advOpts{}},
+				rebuild{"Swap " + d + ", validator NONE: amountIn doubled", 0x42, signed, swap(f, 40_000, bsvIn, nil, f.changePkh, satsPkh), advOpts{}, advOpts{}},
+				rebuild{"Swap " + d + ", validator NONE: direction flipped", 0x42, signed, swap(f, 20_000, !bsvIn, nil, f.changePkh, satsPkh), advOpts{}, advOpts{}},
+				rebuild{"Swap " + d + ", validator NONE: token and sats change to the thief", 0x42, signed, swap(f, 20_000, bsvIn, nil, thief, thief), advOpts{}, advOpts{}},
+				rebuild{"Swap " + d + ", validator SINGLE: token change to the thief", 0x43, signed, swap(f, 20_000, bsvIn, nil, thief, satsPkh), advOpts{}, advOpts{}},
+				rebuild{"Swap " + d + ", validator ALL|ANYONECANPAY: an input added", 0xc1, signed, signed, advOpts{}, advOpts{extraIns: 1}},
+			)
+		}
+		rs := f.rescindCall(p)
+		red := rs
+		red.outs = advCopy(rs.outs)
+		red.outs[1] = out{rs.change.sats, p2pkh(thief)}
+		red.change = &struct {
+			pkh  []byte
+			sats int64
+		}{thief, rs.change.sats}
+		cases = append(cases,
+			rebuild{"Rescind, validator NONE: sats change to the thief", 0x42, rs, red, advOpts{}, advOpts{}},
+			rebuild{"Rescind, validator ALL|ANYONECANPAY: an input added", 0xc1, rs, rs, advOpts{}, advOpts{extraIns: 1}},
+		)
+
+		for _, c := range cases {
+			c := c
+			t.Run(fmt.Sprintf("fees%d-%d-%d: %s", cfg.lp, cfg.v, cfg.c, c.name), func(t *testing.T) {
+				mustPass(t, f.advRun(t, p, c.signed, c.signedO))
+				signedTx, _, _ := f.advTx(p, c.signed, c.signedO)
+				o := c.signedO
+				o.sigFlag = c.flag
+				orig := f.advRun(t, p, c.signed, o)
+				o = c.rebO
+				o.sigFlag, o.sigTx = c.flag, signedTx
+				reb := f.advRun(t, p, c.s, o)
+				o.sigFlag = 0
+				all := f.advRun(t, p, c.s, o)
+				t.Logf("signed tx under %#x: %v; rebuilt: %v; rebuilt under the ALL|FORKID signature: %v", byte(c.flag), orig, reb, all)
+				mustFail(t, orig)
+				mustFail(t, reb)
+				mustFail(t, all)
+			})
+		}
 	}
 }
 
@@ -790,7 +817,7 @@ func TestTheft_SwapOutputSet(t *testing.T) {
 			name      string
 			off, size int
 		}{{"TokenReserve", offTokens, 8}, {"LpPubKey", offLp, 33}, {"ValidatorPubKey", offVal, 33}, {"ValidatorIdentity", offIdentity, 33},
-			{"Nonce", offNonce, 32}, {"LpSatsPkh", offSats, 20}, {"LpTokenPkh", offTokenPkh, 20}, {"Affirmation", offAffLen + 1, len(affirmation)}} {
+			{"Nonce", offNonce, 32}, {"LpSatsPkh", offSats, 20}, {"LpTokenPkh", offTokenPkh, 20}, {"AffirmationR", offAffR, 32}, {"AffirmationS", offAffS, 32}} {
 			for _, which := range []string{"first", "last"} {
 				fld, which := fld, which
 				s2 := append([]byte{}, st...)
@@ -819,10 +846,10 @@ func TestTheft_SwapOutputSet(t *testing.T) {
 			name string
 			s    []byte
 		}{
-			{"Affirmation one byte shorter", append(append([]byte{}, st[:offAffLen]...), append([]byte{byte(len(affirmation) - 1)}, affirmation[:len(affirmation)-1]...)...)},
-			{"Affirmation one byte longer", append(append([]byte{}, st[:offAffLen]...), append([]byte{byte(len(affirmation) + 1)}, append(append([]byte{}, affirmation...), 0x00)...)...)},
+			{"AffirmationR and AffirmationS swapped", append(append(append([]byte{}, st[:offAffR]...), affirmationS...), affirmationR...)},
 			{"a trailing byte after the state", append(append([]byte{}, st...), 0x00)},
 			{"state with its last byte missing", st[:len(st)-1]},
+			{"a length byte before the affirmation (a framing the writer does not use)", append(append(append([]byte{}, st[:offAffR]...), 64), st[offAffR:]...)},
 		} {
 			v := v
 			cont := advCopy(base.outs)
@@ -955,19 +982,23 @@ func TestTrustModel_ValidatorDrainsWithFakeTokenInput(t *testing.T) {
 	})
 }
 
-// TestTrustModel_ValidatorNamesUnusableNextKey: BY DESIGN. nextValidatorPubKey is
-// not checked: not a curve point, or a key nobody holds, is accepted. Afterwards
-// no Swap or Rescind is possible; the LP can still Close. Off-chain: the
-// validator derives the next key (BRC-42) and the lookup lists no pool whose key
-// breaks the derivation.
+// TestTrustModel_ValidatorNamesUnusableNextKey: BY DESIGN. Swap checks the
+// next key's length (33 bytes) and first byte (02 or 03), nothing more: 02 or
+// 03 followed by any 32 bytes, a point on the curve or not, a key nobody
+// holds, is accepted. Afterwards no Swap or
+// Rescind is possible; the LP can still Close. Off-chain: the validator
+// derives the next key (BRC-42) and the lookup lists no pool whose key breaks
+// the derivation. (Other first bytes, the 33 zero bytes among them, are
+// refused, and so is every other length: TestStrictNextKeyType.)
 func TestTrustModel_ValidatorNamesUnusableNextKey(t *testing.T) {
 	advEach(t, func(t *testing.T, f *fixture, p pool, bsvIn bool) {
 		for _, kc := range []struct {
 			name string
 			k    []byte
 		}{
-			{"not a curve point (33 x 0x05)", bytes.Repeat([]byte{0x05}, 33)},
-			{"33 zero bytes", make([]byte, 33)},
+			{"02 then 32 x 0x05", append([]byte{0x02}, bytes.Repeat([]byte{0x05}, 32)...)},
+			{"03 then 32 x 0xff (x above the field prime: not a point)", append([]byte{0x03}, bytes.Repeat([]byte{0xff}, 32)...)},
+			{"02 then 32 zero bytes", append([]byte{0x02}, make([]byte, 32)...)},
 			{"a valid key nobody holds", func() []byte { k := key(nil, 0x45); return k.PubKey().Compressed() }()},
 		} {
 			kc := kc
@@ -1000,87 +1031,61 @@ func TestTrustModel_ValidatorNamesUnusableNextKey(t *testing.T) {
 	})
 }
 
-// TestTheft_NextKeyLength_PinnedRunarAccepts records what happens when the next
-// key is not 33 bytes. Not a by-design case: on the pinned Rúnar a validator-signed
-// Swap with such a key is ACCEPTED and writes a continuation that is not the
-// pool's code. Rúnar main checks the parameter's length and refuses it. On
-// the pin the continuation's state differs in length from the spent one, and
-// poolScript recovers the code by subtracting the NEW state's length, so the
-// continuation's code part is off by that many bytes. The test then tries to
-// spend that continuation (the LP's Close among others): every attempt is
-// refused, so the pool's funds are stuck.
-func TestTheft_NextKeyLength_PinnedRunarAccepts(t *testing.T) {
+// advWideKeySwap is the Swap of p (bsv in, 20,000 sats) naming the raw next
+// key nk, and the continuation the contract writes for it: the token prefix,
+// the spent scriptCode minus the NEW state's length (poolScript), and the new
+// state with nk at ValidatorPubKey whatever its width.
+func (f *fixture) advWideKeySwap(p pool, nk []byte) (call, pool) {
+	r := f.expectSwap(p, 20_000, true)
+	st := r.pool(p).state()
+	ns := append(append(append([]byte{}, st[:offVal]...), nk...), st[offVal+33:]...)
+	sc := append(append(append([]byte{}, f.code[2:]...), 0x6a), p.state()...)
+	body := sc[:len(sc)-len(ns)]
+	written := append(append(append(tokenPrefix(r.newTokens), 0x61, 0xab), body...), ns...)
+	c := f.swapCall(p, 20_000, true, r)
+	c.args = append([][]byte{}, c.args...)
+	c.args[1] = pushData(nk)
+	c.outs = advCopy(c.outs)
+	c.outs[0].script = written
+	return c, pool{bsv: r.newBsv, tokens: r.newTokens, lp: p.lp, validator: r.nextValidator, lock: written}
+}
+
+// advWideKey is a 66-byte next key: held's compressed key, then three
+// OP_ENDIF and an OP_RETURN at the end of 33 bytes of OP_NOP.
+func advWideKey(held *ec.PrivateKey) []byte {
+	return append(append(held.PubKey().Compressed(), bytes.Repeat([]byte{0x61}, 29)...), 0x68, 0x68, 0x68, 0x6a)
+}
+
+// A next key of any width but 33 bytes is refused by Swap's own length check,
+// on both toolchains. Without it the pinned Rúnar (whose state writer does not
+// check widths) accepted one and wrote a pool that no longer read as the pool:
+// poolScript takes the continuation's code as the spent scriptCode minus the
+// NEW state's length, and Close reads the state as the script's last 243
+// bytes. A 66-byte key — a key of the validator's own, then 33 bytes of its
+// choosing — cut the code's last 32 bytes (the end of Rescind's branch) and
+// put the validator's key where Close reads LpPubKey; the 33 free bytes closed
+// Rescind's open branches (OP_ENDIF) and ended the script (OP_RETURN) where
+// the code would have. The validator then Closed the pool, its outputs free,
+// and the LP could not. The Swap is refused now; the lock it would have
+// written is run as a hand-built output only to record what it would allow.
+func TestTheft_WideNextKeyCannotHandThePoolToTheValidator(t *testing.T) {
 	f := advFix(t, advCfg{30, 5, 10})
 	p := advPool(t)
-	r := f.expectSwap(p, 20_000, true)
-	head := advIsHead(t)
-	t.Logf("Rúnar HEAD (codePartLenSlots present): %v", head)
-	for _, n := range []int{0, 1, 32, 34, 65} {
-		n := n
-		t.Run(fmt.Sprintf("next key of %d bytes", n), func(t *testing.T) {
-			k := bytes.Repeat([]byte{0x05}, n)
-			c := f.swapCall(p, 20_000, true, r)
-			c.args = append([][]byte{}, c.args...)
-			c.args[1] = pushData(k)
-			// The continuation as the contract would build it: state with the key
-			// at its slot, code = spent scriptCode minus the new state's length.
-			st := r.pool(p).state()
-			ns := append(append(append([]byte{}, st[:offVal]...), k...), st[offVal+33:]...)
-			// try both candidate shapes; log which (if any) is accepted
-			var accepted []string
-			cands := map[string][]byte{}
-			cands["code+state(len adjusted)"] = advLock(tokenPrefix(r.newTokens), f.code, ns)
-			full := append(append([]byte{}, f.code...), 0x6a)
-			full = append(full, p.state()...)
-			body := full[:len(full)-len(ns)]
-			cands["scriptCode minus new state length"] = append(append(append([]byte{}, tokenPrefix(r.newTokens)...), body...), ns...)
-			for name, s := range cands {
-				cc := c
-				cc.outs = advCopy(c.outs)
-				cc.outs[0].script = s
-				err := f.advRun(t, p, cc, advOpts{})
-				t.Logf("  shape %q: %v", name, err)
-				if err == nil {
-					accepted = append(accepted, name)
-				}
-			}
-			t.Logf("next key %d bytes: accepted shapes = %v", n, accepted)
-			// Observed. Rúnar HEAD: refused (OP_NUMEQUALVERIFY, a length check on the
-			// PubKey parameter). Pinned Rúnar: no check; the continuation is then the
-			// spent scriptCode minus the NEW state's length, i.e. a pool whose code is
-			// not the pool's code (truncated or extended). Validator-only.
-			if head {
-				if len(accepted) > 0 {
-					t.Errorf("HEAD: a %d-byte next key was accepted: %v", n, accepted)
-				}
-			} else if len(accepted) != 1 || accepted[0] != "scriptCode minus new state length" {
-				t.Errorf("pinned: expected the shifted-code continuation to be accepted, got %v", accepted)
-			}
-			if head || len(accepted) == 0 {
-				return
-			}
-			// Spend the mis-shaped pool: its lock is prefix || code' || ns.
-			bad := pool{bsv: r.newBsv, tokens: r.newTokens, lp: p.lp, validator: r.nextValidator, lock: cands[accepted[0]]}
-			clip := func(b []byte) []byte { return b[:len(b)-len(ns)] }
-			shaped := clip(cands[accepted[0]][len(tokenPrefix(r.newTokens)):])
-			for _, cp := range []struct {
-				name string
-				code []byte
-			}{{"original code part", nil}, {"the mis-shaped lock's own code", shaped}} {
-				for _, who := range []struct {
-					name string
-					k    *ec.PrivateKey
-				}{{"LP", p.lp}, {"random key", advRand(t)}, {"first validator", p.validator}} {
-					err := f.advRun(t, bad, advSetSigner(advCloseTo(bad, pkh(who.k)), who.k), advOpts{codePart: cp.code})
-					t.Logf("  mis-shaped pool, Close by %s, %s: accepted=%v (%v)", who.name, cp.name, err == nil, err)
-					// Observed: no one, the LP included, spends it with these attempts.
-					if err == nil {
-						t.Errorf("mis-shaped pool spent by %s (%s)", who.name, cp.name)
-					}
-				}
-			}
-		})
-	}
+	held := key(t, 0x5d)
+	nk := advWideKey(held)
+	c, after := f.advWideKeySwap(p, nk)
+	deltaCheck(t, "Swap naming a 66-byte next key (a key of the validator's first)", f.run(t, p, c), deltaFail, deltaFail)
+	t.Run("the honest continuation: the validator cannot Close it", func(t *testing.T) {
+		r := f.expectSwap(p, 20_000, true)
+		honest := r.pool(p)
+		mustPass(t, f.run(t, honest, f.closeCall(honest)))
+		mustFail(t, f.run(t, honest, advSetSigner(f.closeCall(honest), held)))
+		mustFail(t, f.run(t, honest, advSetSigner(f.closeCall(honest), r.nextValidator)))
+	})
+	steal := advCloseTo(after, pkh(held))
+	steal.signers = []*ec.PrivateKey{held}
+	deltaCheck(t, "the lock that Swap would have written, hand-built: Close by the validator's key", f.run(t, after, steal), deltaPass, deltaPass)
+	deltaCheck(t, "the lock that Swap would have written, hand-built: the LP's Close", f.run(t, after, f.closeCall(after)), deltaFail, deltaFail)
 }
 
 // TestTrustModel_ValidatorRescindsAnytime: BY DESIGN. The validator can Rescind
@@ -1370,14 +1375,21 @@ func TestTheft_ExtraLeadingPushes(t *testing.T) {
 // script (it is not signed). Each single mutation is tried; the outputs are
 // pinned by the contract's own hashOutputs check, so the transaction's outputs
 // are the same in every accepted variant. Expected acceptances: free bytes
-// (commissionPkh when the commission is 0, tokenChangePkh when tokenChange is 0,
-// _changePKH when _changeAmount is 0) and alternative encodings of the same
-// value. Anything else accepted fails the test.
+// (commissionPkh when the commission is 0 and tokenChangePkh when tokenChange
+// is 0, each still pinned to 20 bytes; _changePKH when _changeAmount is 0) and
+// alternative encodings of the same value. allPrevouts is bound to the
+// preimage's hashPrevouts: any other bytes are refused. Anything else
+// accepted fails the test.
 func TestTheft_UnlockingMalleability(t *testing.T) {
 	advEach(t, func(t *testing.T, f *fixture, p pool, bsvIn bool) {
 		r := f.expectSwap(p, 20_000, bsvIn)
 		base := f.swapCall(p, 20_000, bsvIn, r)
 		other20 := pushData(bytes.Repeat([]byte{0xcd}, 20))
+		tx, _, _ := f.advTx(p, base, advOpts{})
+		prevouts := advPrevouts(tx)
+		setPrevouts := func(b []byte) func(c *call, o *advOpts) {
+			return func(c *call, o *advOpts) { o.prevouts = b }
+		}
 		type mut struct {
 			name     string
 			wantPass bool
@@ -1402,8 +1414,21 @@ func TestTheft_UnlockingMalleability(t *testing.T) {
 			{"bsvIn as PUSHDATA1 of the same bool (accepted when true; non-minimal false is rejected)", bsvIn, setArg(3, map[bool][]byte{true: {0x4c, 0x01, 0x01}, false: {0x4c, 0x01, 0x00}}[bsvIn])},
 			{"bsvIn as 0x02 (truthy, not 1)", false, setArg(3, []byte{0x01, 0x02})},
 			{"userPkh changed", false, setArg(4, other20)},
+			{"nextValidatorPubKey: 04 first byte", false, setArg(1, pushData(append([]byte{0x04}, key(t, 0x31).PubKey().Compressed()[1:]...)))},
 			{"commissionPkh changed", noCommission, setArg(5, other20)},
+			{"commissionPkh 19 bytes", false, setArg(5, pushData(bytes.Repeat([]byte{0xcd}, 19)))},
+			{"commissionPkh 21 bytes", false, setArg(5, pushData(bytes.Repeat([]byte{0xcd}, 21)))},
 			{"tokenChangePkh changed (tokenChange is 0)", true, setArg(6, other20)},
+			{"tokenChangePkh 19 bytes (tokenChange is 0)", false, setArg(6, pushData(bytes.Repeat([]byte{0xcd}, 19)))},
+			{"tokenChangePkh empty (tokenChange is 0)", false, setArg(6, []byte{0x00})},
+			{"allPrevouts with a byte appended", false, setPrevouts(append(append([]byte{}, prevouts...), 0x00))},
+			{"allPrevouts without its last byte", false, setPrevouts(prevouts[:len(prevouts)-1])},
+			{"allPrevouts: the pool's outpoint alone", false, setPrevouts(prevouts[:36])},
+			{"allPrevouts: the funding outpoint's index changed", false, setPrevouts(append(append([]byte{}, prevouts[:68]...), 0x01, 0, 0, 0))},
+			{"allPrevouts empty", false, setPrevouts([]byte{})},
+			{"allPrevouts as PUSHDATA2 (same bytes)", true, func(c *call, o *advOpts) {
+				o.prevoutsRaw = append([]byte{0x4d, byte(len(prevouts)), byte(len(prevouts) >> 8)}, prevouts...)
+			}},
 			{"tokenChange 0 -> 1", false, setArg(7, pushNum(1))},
 			{"tokenChange 0 as 0x01 0x00", true, setArg(7, []byte{0x01, 0x00})},
 			{"tokenChange 0 as negative zero", true, setArg(7, []byte{0x01, 0x80})},
@@ -1528,29 +1553,46 @@ func TestTheft_RescindedPool(t *testing.T) {
 
 // --- 10. pool input position and two pools in one transaction ---
 
+// Swap and Rescind require the pool to be input 0 (requireInputZero); Close
+// does not look. Each refusal below is the same transaction as an accepted
+// one but for where the pool sits, signed over its real digest, with the
+// transaction's real allPrevouts.
 func TestTheft_PoolInputIndex(t *testing.T) {
 	advEach(t, func(t *testing.T, f *fixture, p pool, bsvIn bool) {
-		t.Run("Swap with the pool at input 1", func(t *testing.T) {
-			c := advValid(f, p, methodSwap, bsvIn)
-			c.poolIndex = 1
-			mustPass(t, f.run(t, p, c))
-		})
-		t.Run("Rescind with the pool at input 1", func(t *testing.T) {
-			c := f.rescindCall(p)
-			c.poolIndex = 1
-			mustPass(t, f.run(t, p, c))
-		})
+		for _, m := range []int{methodSwap, methodRescind} {
+			mn := advMethodNames[m]
+			t.Run(mn+" with the pool at input 0 (control)", func(t *testing.T) {
+				mustPass(t, f.advRun(t, p, advValid(f, p, m, bsvIn), advOpts{}))
+			})
+			t.Run(mn+" with the pool at input 1: refused", func(t *testing.T) {
+				c := advValid(f, p, m, bsvIn)
+				c.poolIndex = 1
+				mustFail(t, f.advRun(t, p, c, advOpts{}))
+			})
+			t.Run(mn+" with the pool at input 3, two inputs before it: refused", func(t *testing.T) {
+				mustFail(t, f.advRun(t, p, advValid(f, p, m, bsvIn), advOpts{extraBefore: 2}))
+			})
+			t.Run(mn+" with the pool at input 0 and two more inputs after the funding", func(t *testing.T) {
+				mustPass(t, f.advRun(t, p, advValid(f, p, m, bsvIn), advOpts{extraIns: 2}))
+			})
+		}
 		t.Run("wrong signer with the pool at input 1", func(t *testing.T) {
 			c := advSetSigner(advValid(f, p, methodSwap, bsvIn), p.lp)
 			c.poolIndex = 1
-			mustFail(t, f.run(t, p, c))
+			mustFail(t, f.advRun(t, p, c, advOpts{}))
+		})
+		t.Run("Close with the pool at input 1 and at input 3", func(t *testing.T) {
+			c := f.closeCall(p)
+			c.poolIndex = 1
+			mustPass(t, f.advRun(t, p, c, advOpts{}))
+			mustPass(t, f.advRun(t, p, f.closeCall(p), advOpts{extraBefore: 2}))
 		})
 	})
 }
 
 // advTwoPools builds one tx with pool A at input 0 and pool B at input 1, the
-// given outputs, and runs both pools' unlocking (method m, the call callA/callB
-// for argument layout and signers).
+// given outputs, and runs both pools' unlocking (each call's method, argument
+// layout, signers and allPrevouts override).
 func (f *fixture) advTwoPools(t *testing.T, a, b pool, ca, cb call, outs []out) (errA, errB error) {
 	t.Helper()
 	la, lb := f.poolScript(a), f.poolScript(b)
@@ -1578,14 +1620,14 @@ func mustHash(b byte) *chainhash.Hash {
 	return h
 }
 
-// Two pools spent in one transaction, both Swap. Each demands its own
-// continuation at output 0 (hashOutputs is over the whole output list), so two
-// distinct pools cannot both be satisfied. Two byte-identical pools (same code,
-// state and sats, different outpoints) demand the same output list and CAN both
-// be satisfied: the tx then carries one continuation for two pools' sats, the
-// second pool's sats going to the miner. Both inputs need the validator's
-// signature (same key), so this is validator-only, but it is accepted at script
-// level and recorded here.
+// Two pools spent in one transaction. Each builds every output from output 0
+// on (hashOutputs is over the whole output list), so two distinct pools cannot
+// both be satisfied. Two byte-identical pools (same code, state and sats,
+// different outpoints) demand the same output list: before requireInputZero
+// both inputs verified against one continuation, the second pool's sats left
+// through the change, and the validator (who signs both) could send them
+// anywhere. Now the pool at input 1 is refused, for Swap and for Rescind,
+// whatever it claims as allPrevouts.
 func TestTheft_TwoPoolsOneTransaction(t *testing.T) {
 	advEach(t, func(t *testing.T, f *fixture, a pool, bsvIn bool) {
 		b := pool{bsv: 2_000_000, tokens: 7_000_000, lp: key(t, 11), validator: key(t, 21)}
@@ -1606,25 +1648,52 @@ func TestTheft_TwoPoolsOneTransaction(t *testing.T) {
 				t.Fatal("a merged output list satisfied both pools")
 			}
 		})
-		t.Run("identical pools at two outpoints: one continuation, the second pool's value redirected", func(t *testing.T) {
-			// Observed: both inputs verify against ONE output list (same code, state and sats
-			// give the same expected outputs). The change outputs are unlocking arguments
-			// both inputs agree on, so the validator (who must sign both inputs) can send
-			// the second pool's sats and a token change to any address.
+		thief := pkh(key(t, 0x66))
+		t.Run("identical pools, one Swap's outputs: the pool at input 1 is refused", func(t *testing.T) {
 			ea, eb := f.advTwoPools(t, a, a, ca, ca, ca.outs)
-			if ea != nil || eb != nil {
-				t.Fatalf("identical pools, one shared output list: input 0 err=%v; input 1 err=%v", ea, eb)
-			}
-			thief := pkh(key(t, 0x66))
+			t.Logf("input 0 err=%v; input 1 err=%v", ea, eb)
+			mustPass(t, ea)
+			mustFail(t, eb)
+			// The second pool's sats and a token change to one address.
 			cc := f.withChange(ca, 3_000_000, thief, a.bsv)
 			cc.args = append([][]byte{}, cc.args...)
 			cc.args[6] = pushData(thief)
 			cc.outs = advCopy(cc.outs)
 			cc.outs[len(cc.outs)-2] = out{1, tokenP2pkh(3_000_000, thief)}
 			ea, eb = f.advTwoPools(t, a, a, cc, cc, cc.outs)
-			t.Logf("identical pools, change of %d sats and 3000000 tokens to one address: input 0 err=%v; input 1 err=%v", a.bsv, ea, eb)
-			if ea != nil || eb != nil {
-				t.Fatalf("expected both inputs to verify: %v / %v", ea, eb)
+			t.Logf("with the change redirected: input 0 err=%v; input 1 err=%v", ea, eb)
+			mustPass(t, ea)
+			mustFail(t, eb)
+		})
+		t.Run("identical pools, one Rescind's outputs: the pool at input 1 is refused", func(t *testing.T) {
+			rs := f.rescindCall(a)
+			rs.outs = advCopy(rs.outs)
+			rs.outs[1] = out{a.bsv + rs.change.sats, p2pkh(thief)}
+			rs.change = &struct {
+				pkh  []byte
+				sats int64
+			}{thief, a.bsv + rs.change.sats}
+			ea, eb := f.advTwoPools(t, a, a, rs, rs, rs.outs)
+			t.Logf("input 0 err=%v; input 1 err=%v", ea, eb)
+			mustPass(t, ea)
+			mustFail(t, eb)
+		})
+		t.Run("identical pools: the pool at input 1 claiming to be first", func(t *testing.T) {
+			// B's outpoint first in its allPrevouts (A's second): not the
+			// transaction's hashPrevouts.
+			swapped := append(append(append([]byte{}, mustHash(0x12).CloneBytes()...), 0, 0, 0, 0), append(mustHash(0x11).CloneBytes(), 0, 0, 0, 0)...)
+			cbad := ca
+			cbad.prevouts = swapped
+			rbad := f.rescindCall(a)
+			rbad.prevouts = swapped
+			for _, x := range []struct {
+				name   string
+				ca, cb call
+			}{{"Swap", ca, cbad}, {"Rescind", f.rescindCall(a), rbad}} {
+				ea, eb := f.advTwoPools(t, a, a, x.ca, x.cb, x.ca.outs)
+				t.Logf("%s: input 0 err=%v; input 1 err=%v", x.name, ea, eb)
+				mustPass(t, ea)
+				mustFail(t, eb)
 			}
 		})
 	})

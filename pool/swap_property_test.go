@@ -162,6 +162,9 @@ func propModelSwap(bps [3]int64, bsv, tokens, in *big.Int, bsvIn bool) propVals 
 	if in.Sign() <= 0 {
 		fail("amountIn <= 0")
 	}
+	if in.Cmp(propPow2m1(64)) > 0 {
+		fail("amountIn exceeds 2^64-1")
+	}
 	if v.net.Sign() <= 0 {
 		fail("net <= 0")
 	}
@@ -597,6 +600,9 @@ type propLoc struct {
 	build func(t *testing.T, a *big.Int) (f *fixture, p pool, in *big.Int, bsvIn bool, tc *big.Int, idx int, skip string)
 }
 
+// propFeeLoc reaches a fee of amount a in the token-in direction. Every row
+// of propBoundaries is reachable with amountIn <= 2^64-1 (the contract's
+// bound): at 9999 bps the largest fee is about 1.8e19, above 2^63-1.
 func propFeeLoc(name string, which int) propLoc {
 	return propLoc{name, func(t *testing.T, a *big.Int) (*fixture, pool, *big.Int, bool, *big.Int, int, string) {
 		for _, bps := range []int64{5000, 9999} {
@@ -779,6 +785,7 @@ func TestPropAmountInDomain(t *testing.T) {
 
 	// huge amountIn, with reserves and a 9999 bps fee so only the net enters
 	f9 := propFix(t, 9999, 0, 0)
+	f3 := propFix(t, 3333, 3333, 3333)
 	fz := propFix(t, 0, 0, 0)
 	huge := []struct {
 		name  string
@@ -788,10 +795,16 @@ func TestPropAmountInDomain(t *testing.T) {
 		want  bool
 	}{
 		{"2^63-1 token-in, 9999bps", propPow2m1(63), f9, false, true},
-		{"2^64 token-in, 9999bps", propPow2(64), f9, false, true},
-		{"2^100 token-in, 9999bps (net overflows TokenReserve)", propPow2(100), f9, false, false},
+		// amountIn is a BRC-162 amount: at most 2^64-1, in either direction.
+		{"2^64-1 token-in, 9999bps", propPow2m1(64), f9, false, true},
+		{"2^64 token-in, 9999bps (amountIn above 2^64-1)", propPow2(64), f9, false, false},
+		{"2^64+1 token-in, 9999bps", propAdd(propPow2(64), propBig(1)), f9, false, false},
+		{"2^100 token-in, 9999bps", propPow2(100), f9, false, false},
 		{"2^63-1 sats-in, 9999bps", propPow2m1(63), f9, true, true},
-		{"2^64 sats-in, 9999bps (fee > MaxInt64 sats)", propPow2(64), f9, true, false},
+		{"2^64-1 sats-in, 9999bps (fee > MaxInt64 sats)", propPow2m1(64), f9, true, false},
+		{"2^64-1 sats-in, 3333bps x 3 (each fee fits a sats output)", propPow2m1(64), f3, true, true},
+		{"2^64 sats-in, 3333bps x 3 (amountIn above 2^64-1)", propPow2(64), f3, true, false},
+		{"2^64 sats-in, 9999bps", propPow2(64), f9, true, false},
 		{"2^100 sats-in, 9999bps", propPow2(100), f9, true, false},
 		{"2^63-1 token-in, no fees (TokenReserve overflows)", propPow2m1(63), fz, false, false},
 		{"2^63-1 sats-in, no fees (newBsv overflows)", propPow2m1(63), fz, true, false},
@@ -821,7 +834,8 @@ func TestPropAmountInDomain(t *testing.T) {
 				t.Errorf("bsvIn %v: negative tokenChange %v ACCEPTED", bsvIn, tcv)
 			}
 		}
-		for _, tcv := range []*big.Int{propPow2m1(63), propPow2(64), propPow2(100)} {
+		// A BRC-162 amount: up to 2^64-1 (nine-byte pushes from 2^63 on).
+		for _, tcv := range []*big.Int{propPow2m1(63), propPow2(63), propPow2m1(64)} {
 			c, v := propMake(f, p, propBig(20_000), bsvIn, tcv)
 			if !v.ok {
 				t.Fatal(v.why)
@@ -833,6 +847,34 @@ func TestPropAmountInDomain(t *testing.T) {
 			c.outs = c.outs[:len(c.outs)-1]
 			if err := f.run(t, p, c); err == nil {
 				t.Errorf("bsvIn %v: tokenChange %v with no output ACCEPTED", bsvIn, tcv)
+			}
+		}
+		// Above it: refused, with the output the contract would write or without.
+		for _, tcv := range []*big.Int{propPow2(64), propAdd(propPow2(64), propBig(1)), propPow2(100)} {
+			c, _ := propMake(f, p, propBig(20_000), bsvIn, tcv)
+			if err := f.run(t, p, c); err == nil {
+				t.Errorf("bsvIn %v: tokenChange %v ACCEPTED", bsvIn, tcv)
+			}
+			c.outs = c.outs[:len(c.outs)-1]
+			if err := f.run(t, p, c); err == nil {
+				t.Errorf("bsvIn %v: tokenChange %v with no output ACCEPTED", bsvIn, tcv)
+			}
+		}
+		// A padded push of a valid amount: accepted, the output carrying the
+		// minimal form, never the argument's bytes.
+		for _, tcv := range []*big.Int{propBig(17), propPow2(63), propPow2m1(64)} {
+			c, _ := propMake(f, p, propBig(20_000), bsvIn, tcv)
+			min := propPushBig(tcv)
+			padded := append(append([]byte{byte(len(min))}, min[1:]...), 0x00) // one more byte, the same value
+			c.args = append([][]byte{}, c.args...)
+			c.args[7] = padded
+			if err := f.run(t, p, c); err != nil {
+				t.Errorf("bsvIn %v: tokenChange %v pushed padded (%x), minimal output, rejected: %v", bsvIn, tcv, padded, err)
+			}
+			c.outs = append([]out{}, c.outs...)
+			c.outs[len(c.outs)-1] = out{1, append(append(append(append([]byte{0x20}, assetID...), padded...), 0x6d), p2pkh(f.changePkh)...)}
+			if err := f.run(t, p, c); err == nil {
+				t.Errorf("bsvIn %v: tokenChange %v written as its padded push ACCEPTED", bsvIn, tcv)
 			}
 		}
 	}
